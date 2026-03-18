@@ -123,12 +123,16 @@ pub fn loadFromFile(backing_allocator: std.mem.Allocator, path: []const u8) !Par
 }
 
 pub fn loadFromOpenFile(backing_allocator: std.mem.Allocator, file_handle: std.fs.File) !ParsedFile {
+    const parsed = try parseFromFileHandle(backing_allocator, file_handle);
+    file_handle.close();
+    return parsed;
+}
+
+pub fn parseFromFileHandle(backing_allocator: std.mem.Allocator, file: std.fs.File) !ParsedFile {
     var arena = std.heap.ArenaAllocator.init(backing_allocator);
     errdefer arena.deinit();
 
     const allocator = arena.allocator();
-    var file = file_handle;
-    defer file.close();
 
     const stat = try file.stat();
     const file_size = stat.size;

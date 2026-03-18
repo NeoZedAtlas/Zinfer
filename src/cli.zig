@@ -1,6 +1,7 @@
 const std = @import("std");
 const safetensors = @import("format/safetensors.zig");
 const qwen3_config = @import("model/qwen3_config.zig");
+const tensor_store = @import("tensor/store.zig");
 
 const default_model_dir = "models/Qwen3-0.6B";
 
@@ -24,6 +25,20 @@ pub fn run(allocator: std.mem.Allocator) !void {
         const model_dir = if (args.len >= 3) args[2] else default_model_dir;
         try inspectWeights(allocator, model_dir);
         return;
+    }
+
+    if (std.mem.eql(u8, command, "inspect-tensor")) {
+        if (args.len == 3) {
+            try inspectTensor(allocator, default_model_dir, args[2], 8);
+            return;
+        }
+        if (args.len >= 4) {
+            const count = if (args.len >= 5) try std.fmt.parseInt(usize, args[4], 10) else 8;
+            try inspectTensor(allocator, args[2], args[3], count);
+            return;
+        }
+        try printUsage();
+        return error.InvalidCommand;
     }
 
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -71,6 +86,8 @@ fn printUsage() !void {
         \\  zinfer
         \\  zinfer inspect-config [model_dir]
         \\  zinfer inspect-weights [model_dir]
+        \\  zinfer inspect-tensor <tensor_name>
+        \\  zinfer inspect-tensor [model_dir] <tensor_name> [count]
         \\
         \\Defaults:
         \\  model_dir = models/Qwen3-0.6B
@@ -133,4 +150,39 @@ fn printTensorSummary(
     try stdout.print("  data_offsets: [{d}, {d}]\n", .{ tensor.data_offsets[0], tensor.data_offsets[1] });
     try stdout.print("  absolute_offset: {d}\n", .{tensor.absolute_offset});
     try stdout.print("  byte_len: {d}\n", .{tensor.byteLen()});
+}
+
+fn inspectTensor(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    tensor_name: []const u8,
+    count: usize,
+) !void {
+    const weights_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(weights_path);
+
+    var store = try tensor_store.TensorStore.open(allocator, weights_path);
+    defer store.deinit();
+
+    const tensor = store.getTensor(tensor_name) orelse return error.TensorNotFound;
+    const values = try store.readElementsAsF32Alloc(tensor_name, 0, count);
+    defer allocator.free(values);
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("Zinfer tensor inspection\n", .{});
+    try stdout.print("tensor: {s}\n", .{tensor_name});
+    try stdout.print("weights_path: {s}\n", .{weights_path});
+    try stdout.print("dtype: {s}\n", .{tensor.dtype.name()});
+    try stdout.print("shape: [", .{});
+    for (tensor.shape, 0..) |dim, idx| {
+        if (idx != 0) try stdout.print(", ", .{});
+        try stdout.print("{d}", .{dim});
+    }
+    try stdout.print("]\n", .{});
+    try stdout.print("first_values: [", .{});
+    for (values, 0..) |value, idx| {
+        if (idx != 0) try stdout.print(", ", .{});
+        try stdout.print("{d:.6}", .{value});
+    }
+    try stdout.print("]\n", .{});
 }
