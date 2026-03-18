@@ -1,4 +1,5 @@
 const std = @import("std");
+const safetensors = @import("format/safetensors.zig");
 const qwen3_config = @import("model/qwen3_config.zig");
 
 const default_model_dir = "models/Qwen3-0.6B";
@@ -16,6 +17,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
     if (std.mem.eql(u8, command, "inspect-config")) {
         const model_dir = if (args.len >= 3) args[2] else default_model_dir;
         try inspectConfig(allocator, model_dir);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "inspect-weights")) {
+        const model_dir = if (args.len >= 3) args[2] else default_model_dir;
+        try inspectWeights(allocator, model_dir);
         return;
     }
 
@@ -63,9 +70,67 @@ fn printUsage() !void {
         \\Usage:
         \\  zinfer
         \\  zinfer inspect-config [model_dir]
+        \\  zinfer inspect-weights [model_dir]
         \\
         \\Defaults:
         \\  model_dir = models/Qwen3-0.6B
         \\
     );
+}
+
+fn inspectWeights(allocator: std.mem.Allocator, model_dir: []const u8) !void {
+    const weights_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(weights_path);
+
+    var parsed = try safetensors.loadFromFile(allocator, weights_path);
+    defer parsed.deinit();
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("Zinfer weights inspection\n", .{});
+    try stdout.print("weights_path: {s}\n", .{weights_path});
+    try stdout.print("file_size: {d}\n", .{parsed.file_size});
+    try stdout.print("header_len: {d}\n", .{parsed.header_len});
+    try stdout.print("data_start: {d}\n", .{parsed.data_start});
+    try stdout.print("tensor_count: {d}\n", .{parsed.tensorCount()});
+
+    if (parsed.metadata.count() > 0) {
+        var metadata_it = parsed.metadata.iterator();
+        while (metadata_it.next()) |entry| {
+            try stdout.print("metadata.{s}: {s}\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+        }
+    }
+
+    const sample_names = [_][]const u8{
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    };
+
+    for (sample_names) |name| {
+        if (parsed.getTensor(name)) |tensor| {
+            try printTensorSummary(stdout, name, tensor);
+        }
+    }
+}
+
+fn printTensorSummary(
+    stdout: anytype,
+    name: []const u8,
+    tensor: safetensors.TensorInfo,
+) !void {
+    try stdout.print("tensor: {s}\n", .{name});
+    try stdout.print("  dtype: {s}\n", .{tensor.dtype.name()});
+    try stdout.print("  rank: {d}\n", .{tensor.rank()});
+    try stdout.print("  shape: [", .{});
+    for (tensor.shape, 0..) |dim, idx| {
+        if (idx != 0) try stdout.print(", ", .{});
+        try stdout.print("{d}", .{dim});
+    }
+    try stdout.print("]\n", .{});
+    try stdout.print("  data_offsets: [{d}, {d}]\n", .{ tensor.data_offsets[0], tensor.data_offsets[1] });
+    try stdout.print("  absolute_offset: {d}\n", .{tensor.absolute_offset});
+    try stdout.print("  byte_len: {d}\n", .{tensor.byteLen()});
 }
