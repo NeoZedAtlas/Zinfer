@@ -56,6 +56,26 @@ pub const TensorStore = struct {
         return output;
     }
 
+    pub fn matmulVecByName(
+        self: *const TensorStore,
+        output: []f32,
+        name: []const u8,
+        input: []const f32,
+    ) !void {
+        const tensor = self.getTensor(name) orelse return error.TensorNotFound;
+        if (tensor.rank() != 2) return error.InvalidTensorRank;
+
+        const rows = std.math.cast(usize, tensor.shape[0]) orelse return error.DimensionTooLarge;
+        const cols = std.math.cast(usize, tensor.shape[1]) orelse return error.DimensionTooLarge;
+        if (output.len != rows or input.len != cols) return error.SizeMismatch;
+
+        switch (tensor.dtype) {
+            .bf16 => try self.matmulVecBf16(tensor, output, input),
+            .f32 => try self.matmulVecF32(tensor, output, input),
+            else => return error.UnsupportedTensorDType,
+        }
+    }
+
     fn readBf16AsF32(
         self: *const TensorStore,
         tensor: safetensors.TensorInfo,
@@ -105,6 +125,60 @@ pub const TensorStore = struct {
             value.* = @bitCast(raw);
         }
     }
+
+    fn matmulVecBf16(
+        self: *const TensorStore,
+        tensor: safetensors.TensorInfo,
+        output: []f32,
+        input: []const f32,
+    ) !void {
+        const cols = input.len;
+        const row_bytes = try std.math.mul(usize, cols, 2);
+        const row_buffer = try self.allocator.alloc(u8, row_bytes);
+        defer self.allocator.free(row_buffer);
+
+        for (output, 0..) |*out, row_idx| {
+            const row_offset = try std.math.mul(u64, row_idx, row_bytes);
+            const read_offset = try std.math.add(u64, tensor.absolute_offset, row_offset);
+            const bytes_read = try self.file.preadAll(row_buffer, read_offset);
+            if (bytes_read != row_buffer.len) return error.UnexpectedEndOfFile;
+
+            var sum: f32 = 0.0;
+            for (input, 0..) |x, col_idx| {
+                const start = col_idx * 2;
+                const bits = std.mem.readInt(u16, row_buffer[start .. start + 2][0..2], .little);
+                sum += bfloat16.toF32(bits) * x;
+            }
+            out.* = sum;
+        }
+    }
+
+    fn matmulVecF32(
+        self: *const TensorStore,
+        tensor: safetensors.TensorInfo,
+        output: []f32,
+        input: []const f32,
+    ) !void {
+        const cols = input.len;
+        const row_bytes = try std.math.mul(usize, cols, 4);
+        const row_buffer = try self.allocator.alloc(u8, row_bytes);
+        defer self.allocator.free(row_buffer);
+
+        for (output, 0..) |*out, row_idx| {
+            const row_offset = try std.math.mul(u64, row_idx, row_bytes);
+            const read_offset = try std.math.add(u64, tensor.absolute_offset, row_offset);
+            const bytes_read = try self.file.preadAll(row_buffer, read_offset);
+            if (bytes_read != row_buffer.len) return error.UnexpectedEndOfFile;
+
+            var sum: f32 = 0.0;
+            for (input, 0..) |x, col_idx| {
+                const start = col_idx * 4;
+                const raw = std.mem.readInt(u32, row_buffer[start .. start + 4][0..4], .little);
+                sum += @as(f32, @bitCast(raw)) * x;
+            }
+            out.* = sum;
+        }
+    }
 };
 
 test "tensor store reads a synthetic bf16 tensor" {
@@ -150,4 +224,46 @@ test "tensor store reads a synthetic bf16 tensor" {
     try testing.expectEqual(@as(usize, 2), values.len);
     try testing.expectEqual(@as(f32, 1.0), values[0]);
     try testing.expectEqual(@as(f32, -2.5), values[1]);
+}
+
+test "tensor store matmulVecByName multiplies a synthetic bf16 matrix" {
+    const testing = std.testing;
+
+    const header =
+        \\{"weight":{"dtype":"BF16","shape":[2,3],"data_offsets":[0,12]}}
+    ;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("matmul_bf16.safetensors", .{});
+    defer file.close();
+
+    var length_prefix: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length_prefix, header.len, .little);
+    try file.writeAll(&length_prefix);
+    try file.writeAll(header);
+
+    var payload: [12]u8 = undefined;
+    const matrix = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0 };
+    for (matrix, 0..) |value, idx| {
+        const start = idx * 2;
+        const bits = bfloat16.fromF32(value);
+        payload[start] = @truncate(bits & 0xff);
+        payload[start + 1] = @truncate(bits >> 8);
+    }
+    try file.writeAll(&payload);
+
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("matmul_bf16.safetensors", &path_buffer);
+
+    var store = try TensorStore.open(testing.allocator, path);
+    defer store.deinit();
+
+    const input = [_]f32{ 1.0, 0.5, -1.0 };
+    var output = [_]f32{ 0.0, 0.0 };
+    try store.matmulVecByName(&output, "weight", &input);
+
+    try testing.expectApproxEqAbs(@as(f32, -1.0), output[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), output[1], 1e-6);
 }
