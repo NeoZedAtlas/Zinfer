@@ -5,6 +5,9 @@ const qwen3_block = @import("model/qwen3_block.zig");
 const qwen3_model = @import("model/qwen3_model.zig");
 const qwen3_config = @import("model/qwen3_config.zig");
 const tensor_store = @import("tensor/store.zig");
+const qwen_bpe = @import("tokenizer/qwen_bpe.zig");
+const qwen_chat_template = @import("tokenizer/qwen_chat_template.zig");
+const sampler = @import("sampling/sampler.zig");
 
 const default_model_dir = "models/Qwen3-0.6B";
 
@@ -153,6 +156,56 @@ pub fn run(allocator: std.mem.Allocator) !void {
         return error.InvalidCommand;
     }
 
+    if (std.mem.eql(u8, command, "tokenize")) {
+        if (args.len == 3) {
+            try tokenizeText(allocator, default_model_dir, args[2]);
+            return;
+        }
+        if (args.len >= 4) {
+            try tokenizeText(allocator, args[2], args[3]);
+            return;
+        }
+        try printUsage();
+        return error.InvalidCommand;
+    }
+
+    if (std.mem.eql(u8, command, "decode-ids")) {
+        if (args.len == 3) {
+            try decodeIds(allocator, default_model_dir, args[2]);
+            return;
+        }
+        if (args.len >= 4) {
+            try decodeIds(allocator, args[2], args[3]);
+            return;
+        }
+        try printUsage();
+        return error.InvalidCommand;
+    }
+
+    if (std.mem.eql(u8, command, "generate")) {
+        if (args.len == 3) {
+            try generateText(allocator, default_model_dir, args[2], 64, .disabled);
+            return;
+        }
+        if (args.len == 4) {
+            const max_new_tokens = try std.fmt.parseInt(usize, args[3], 10);
+            try generateText(allocator, default_model_dir, args[2], max_new_tokens, .disabled);
+            return;
+        }
+        if (args.len == 5) {
+            const max_new_tokens = try std.fmt.parseInt(usize, args[3], 10);
+            try generateText(allocator, default_model_dir, args[2], max_new_tokens, try parseThinkingMode(args[4]));
+            return;
+        }
+        if (args.len >= 6) {
+            const max_new_tokens = try std.fmt.parseInt(usize, args[4], 10);
+            try generateText(allocator, args[2], args[3], max_new_tokens, try parseThinkingMode(args[5]));
+            return;
+        }
+        try printUsage();
+        return error.InvalidCommand;
+    }
+
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage();
         return;
@@ -208,6 +261,12 @@ fn printUsage() !void {
         \\  zinfer probe-model [model_dir] <token_id> <top_k>
         \\  zinfer generate-token-ids [seed_ids_csv] [steps]
         \\  zinfer generate-token-ids [model_dir] <seed_ids_csv> <steps>
+        \\  zinfer tokenize <text>
+        \\  zinfer tokenize [model_dir] <text>
+        \\  zinfer decode-ids <ids_csv>
+        \\  zinfer decode-ids [model_dir] <ids_csv>
+        \\  zinfer generate <text> [max_new_tokens] [think|no-think]
+        \\  zinfer generate [model_dir] <text> <max_new_tokens> [think|no-think]
         \\
         \\Defaults:
         \\  model_dir = models/Qwen3-0.6B
@@ -537,4 +596,154 @@ fn parseTokenIdsAlloc(
     }
 
     return list.toOwnedSlice(allocator);
+}
+
+fn tokenizeText(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    text: []const u8,
+) !void {
+    var tokenizer = try qwen_bpe.Tokenizer.loadFromModelDir(allocator, model_dir);
+    defer tokenizer.deinit();
+
+    const ids = try tokenizer.encodeAlloc(allocator, text);
+    defer allocator.free(ids);
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("Zinfer tokenize\n", .{});
+    try stdout.print("text: {s}\n", .{text});
+    try stdout.print("ids: [", .{});
+    for (ids, 0..) |id, idx| {
+        if (idx != 0) try stdout.print(", ", .{});
+        try stdout.print("{d}", .{id});
+    }
+    try stdout.print("]\n", .{});
+}
+
+fn decodeIds(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    ids_csv: []const u8,
+) !void {
+    var tokenizer = try qwen_bpe.Tokenizer.loadFromModelDir(allocator, model_dir);
+    defer tokenizer.deinit();
+
+    const ids_usize = try parseTokenIdsAlloc(allocator, ids_csv);
+    defer allocator.free(ids_usize);
+    const ids = try allocator.alloc(u32, ids_usize.len);
+    defer allocator.free(ids);
+    for (ids_usize, 0..) |value, idx| {
+        ids[idx] = std.math.cast(u32, value) orelse return error.TokenIdOutOfRange;
+    }
+
+    const text = try tokenizer.decodeAlloc(allocator, ids);
+    defer allocator.free(text);
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("Zinfer decode\n", .{});
+    try stdout.print("ids: {s}\n", .{ids_csv});
+    try stdout.print("text: {s}\n", .{text});
+}
+
+fn generateText(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    user_text: []const u8,
+    max_new_tokens: usize,
+    thinking_mode: qwen_chat_template.ThinkingMode,
+) !void {
+    var tokenizer = try qwen_bpe.Tokenizer.loadFromModelDir(allocator, model_dir);
+    defer tokenizer.deinit();
+
+    const prompt = try qwen_chat_template.renderSingleUserPromptAlloc(allocator, user_text, thinking_mode);
+    defer allocator.free(prompt);
+
+    const prompt_ids_u32 = try tokenizer.encodeAlloc(allocator, prompt);
+    defer allocator.free(prompt_ids_u32);
+    if (prompt_ids_u32.len == 0) return error.EmptyPrompt;
+
+    const prompt_ids = try allocator.alloc(usize, prompt_ids_u32.len);
+    defer allocator.free(prompt_ids);
+    for (prompt_ids_u32, 0..) |token_id, idx| {
+        prompt_ids[idx] = token_id;
+    }
+
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+    defer allocator.free(config_path);
+    var parsed_config = try qwen3_config.loadFromFile(allocator, config_path);
+    defer parsed_config.deinit();
+    const cfg = parsed_config.value;
+
+    const weights_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(weights_path);
+    var store = try tensor_store.TensorStore.open(allocator, weights_path);
+    defer store.deinit();
+
+    var cache = try qwen3_model.ModelCache.init(
+        allocator,
+        cfg.num_hidden_layers,
+        prompt_ids.len + max_new_tokens,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+    );
+    defer cache.deinit();
+
+    var last_logits: ?[]f32 = null;
+    defer if (last_logits) |buffer| allocator.free(buffer);
+
+    for (prompt_ids) |token_id| {
+        const logits = try qwen3_model.forwardTokenId(allocator, &store, cfg, &cache, token_id);
+        if (last_logits) |buffer| allocator.free(buffer);
+        last_logits = logits;
+    }
+
+    var generated = std.ArrayListUnmanaged(u32).empty;
+    defer generated.deinit(allocator);
+
+    const sampling_cfg: sampler.SamplingConfig = switch (thinking_mode) {
+        .enabled => .{ .temperature = 0.6, .top_k = 20, .top_p = 0.95 },
+        .disabled => .{ .temperature = 0.7, .top_k = 20, .top_p = 0.8 },
+    };
+
+    var prng = std.Random.DefaultPrng.init(0);
+    for (0..max_new_tokens) |_| {
+        const current_logits = last_logits orelse return error.MissingPromptLogits;
+        const next_token = try sampler.sampleToken(allocator, prng.random(), current_logits, sampling_cfg);
+        if (isEosToken(next_token)) {
+            allocator.free(current_logits);
+            last_logits = null;
+            break;
+        }
+
+        try generated.append(allocator, std.math.cast(u32, next_token) orelse return error.TokenIdOutOfRange);
+        const next_logits = try qwen3_model.forwardTokenId(allocator, &store, cfg, &cache, next_token);
+        allocator.free(current_logits);
+        last_logits = next_logits;
+    }
+
+    const response = try tokenizer.decodeAlloc(allocator, generated.items);
+    defer allocator.free(response);
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("Zinfer generate\n", .{});
+    try stdout.print("mode: {s}\n", .{thinkingModeName(thinking_mode)});
+    try stdout.print("prompt: {s}\n", .{user_text});
+    try stdout.print("response: {s}\n", .{response});
+}
+
+fn parseThinkingMode(text: []const u8) !qwen_chat_template.ThinkingMode {
+    if (std.mem.eql(u8, text, "think")) return .enabled;
+    if (std.mem.eql(u8, text, "no-think")) return .disabled;
+    return error.InvalidThinkingMode;
+}
+
+fn thinkingModeName(mode: qwen_chat_template.ThinkingMode) []const u8 {
+    return switch (mode) {
+        .enabled => "think",
+        .disabled => "no-think",
+    };
+}
+
+fn isEosToken(token_id: usize) bool {
+    return token_id == 151645 or token_id == 151643;
 }
