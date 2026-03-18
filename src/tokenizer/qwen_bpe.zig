@@ -77,7 +77,7 @@ pub const Tokenizer = struct {
                 continue;
             }
 
-            const segment = nextPretokenizedSegment(text, &index) orelse break;
+            const segment = self.nextPretokenizedSegment(text, &index) orelse break;
             if (segment.len == 0) continue;
             try self.encodeSegment(allocator, backing_allocator, segment, &ids);
         }
@@ -193,6 +193,150 @@ pub const Tokenizer = struct {
             }
         }
         return best;
+    }
+
+    fn nextPretokenizedSegment(self: *const Tokenizer, text: []const u8, index: *usize) ?[]const u8 {
+        if (index.* >= text.len) return null;
+
+        const start = index.*;
+        const first_len = std.unicode.utf8ByteSequenceLength(text[start]) catch return null;
+        const first_slice = text[start .. start + first_len];
+        const first_cp = std.unicode.utf8Decode(first_slice) catch return null;
+
+        if (isNewline(first_cp)) {
+            var end = start + first_len;
+            while (end < text.len) {
+                if (self.matchSpecialToken(text[end..]) != null) break;
+                const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
+                const slice = text[end .. end + len];
+                const cp = std.unicode.utf8Decode(slice) catch break;
+                if (!isNewline(cp)) break;
+                end += len;
+            }
+            index.* = end;
+            return text[start..end];
+        }
+
+        if (isHorizontalWhitespace(first_cp)) {
+            var end = start;
+            while (end < text.len) {
+                if (self.matchSpecialToken(text[end..]) != null) break;
+                const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
+                const slice = text[end .. end + len];
+                const cp = std.unicode.utf8Decode(slice) catch break;
+                if (!isHorizontalWhitespace(cp)) break;
+                end += len;
+            }
+            if (end < text.len) {
+                if (self.matchSpecialToken(text[end..]) != null) {
+                    index.* = end;
+                    return text[start..end];
+                }
+                const len = std.unicode.utf8ByteSequenceLength(text[end]) catch 0;
+                if (len != 0) {
+                    const cp = std.unicode.utf8Decode(text[end .. end + len]) catch 0;
+                    if (isLetterLike(cp)) {
+                        if (end - start > 1) {
+                            index.* = end - 1;
+                            return text[start .. end - 1];
+                        }
+                        var word_end = end + len;
+                        while (word_end < text.len) {
+                            if (self.matchSpecialToken(text[word_end..]) != null) break;
+                            const next_len = std.unicode.utf8ByteSequenceLength(text[word_end]) catch break;
+                            const next_slice = text[word_end .. word_end + next_len];
+                            const next_cp = std.unicode.utf8Decode(next_slice) catch break;
+                            if (!isLetterLike(next_cp)) break;
+                            word_end += next_len;
+                        }
+                        index.* = word_end;
+                        return text[start..word_end];
+                    }
+                    if (!isDigitLike(cp) and !isNewline(cp) and !isHorizontalWhitespace(cp)) {
+                        if (end - start > 1) {
+                            index.* = end - 1;
+                            return text[start .. end - 1];
+                        }
+                        var punct_end = end + len;
+                        while (punct_end < text.len) {
+                            if (self.matchSpecialToken(text[punct_end..]) != null) break;
+                            const next_len = std.unicode.utf8ByteSequenceLength(text[punct_end]) catch break;
+                            const next_slice = text[punct_end .. punct_end + next_len];
+                            const next_cp = std.unicode.utf8Decode(next_slice) catch break;
+                            if (isDigitLike(next_cp) or isLetterLike(next_cp) or isNewline(next_cp) or isHorizontalWhitespace(next_cp)) break;
+                            punct_end += next_len;
+                        }
+                        while (punct_end < text.len) {
+                            if (self.matchSpecialToken(text[punct_end..]) != null) break;
+                            const next_len = std.unicode.utf8ByteSequenceLength(text[punct_end]) catch break;
+                            const next_slice = text[punct_end .. punct_end + next_len];
+                            const next_cp = std.unicode.utf8Decode(next_slice) catch break;
+                            if (!isNewline(next_cp)) break;
+                            punct_end += next_len;
+                        }
+                        index.* = punct_end;
+                        return text[start..punct_end];
+                    }
+                }
+            }
+            index.* = end;
+            return text[start..end];
+        }
+
+        if (first_slice.len == 1 and first_slice[0] == '\'') {
+            if (matchContraction(text[start..])) |contr_len| {
+                index.* = start + contr_len;
+                return text[start..index.*];
+            }
+        }
+
+        if (isLetterLike(first_cp)) {
+            var end = start + first_len;
+            while (end < text.len) {
+                if (self.matchSpecialToken(text[end..]) != null) break;
+                const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
+                const slice = text[end .. end + len];
+                const cp = std.unicode.utf8Decode(slice) catch break;
+                if (!isLetterLike(cp)) break;
+                end += len;
+            }
+            index.* = end;
+            return text[start..end];
+        }
+
+        if (isDigitLike(first_cp)) {
+            var end = start + first_len;
+            while (end < text.len) {
+                if (self.matchSpecialToken(text[end..]) != null) break;
+                const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
+                const slice = text[end .. end + len];
+                const cp = std.unicode.utf8Decode(slice) catch break;
+                if (!isDigitLike(cp)) break;
+                end += len;
+            }
+            index.* = end;
+            return text[start..end];
+        }
+
+        var end = start + first_len;
+        while (end < text.len) {
+            if (self.matchSpecialToken(text[end..]) != null) break;
+            const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
+            const slice = text[end .. end + len];
+            const cp = std.unicode.utf8Decode(slice) catch break;
+            if (isNewline(cp) or isHorizontalWhitespace(cp) or isLetterLike(cp) or isDigitLike(cp)) break;
+            end += len;
+        }
+        while (end < text.len) {
+            if (self.matchSpecialToken(text[end..]) != null) break;
+            const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
+            const slice = text[end .. end + len];
+            const cp = std.unicode.utf8Decode(slice) catch break;
+            if (!isNewline(cp)) break;
+            end += len;
+        }
+        index.* = end;
+        return text[start..end];
     }
 };
 
@@ -334,137 +478,6 @@ fn computeMaxId(vocab: std.StringHashMapUnmanaged(u32), special_tokens: []const 
         max_id = @max(max_id, token.id);
     }
     return max_id;
-}
-
-fn nextPretokenizedSegment(text: []const u8, index: *usize) ?[]const u8 {
-    if (index.* >= text.len) return null;
-
-    const start = index.*;
-    const first_len = std.unicode.utf8ByteSequenceLength(text[start]) catch return null;
-    const first_slice = text[start .. start + first_len];
-    const first_cp = std.unicode.utf8Decode(first_slice) catch return null;
-
-    if (isNewline(first_cp)) {
-        var end = start + first_len;
-        while (end < text.len) {
-            const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
-            const slice = text[end .. end + len];
-            const cp = std.unicode.utf8Decode(slice) catch break;
-            if (!isNewline(cp)) break;
-            end += len;
-        }
-        index.* = end;
-        return text[start..end];
-    }
-
-    if (isHorizontalWhitespace(first_cp)) {
-        var end = start;
-        while (end < text.len) {
-            const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
-            const slice = text[end .. end + len];
-            const cp = std.unicode.utf8Decode(slice) catch break;
-            if (!isHorizontalWhitespace(cp)) break;
-            end += len;
-        }
-        if (end < text.len) {
-            const len = std.unicode.utf8ByteSequenceLength(text[end]) catch 0;
-            if (len != 0) {
-                const cp = std.unicode.utf8Decode(text[end .. end + len]) catch 0;
-                if (isLetterLike(cp)) {
-                    if (end - start > 1) {
-                        index.* = end - 1;
-                        return text[start .. end - 1];
-                    }
-                    var word_end = end + len;
-                    while (word_end < text.len) {
-                        const next_len = std.unicode.utf8ByteSequenceLength(text[word_end]) catch break;
-                        const next_slice = text[word_end .. word_end + next_len];
-                        const next_cp = std.unicode.utf8Decode(next_slice) catch break;
-                        if (!isLetterLike(next_cp)) break;
-                        word_end += next_len;
-                    }
-                    index.* = word_end;
-                    return text[start..word_end];
-                }
-                if (!isDigitLike(cp) and !isNewline(cp) and !isHorizontalWhitespace(cp)) {
-                    if (end - start > 1) {
-                        index.* = end - 1;
-                        return text[start .. end - 1];
-                    }
-                    var punct_end = end + len;
-                    while (punct_end < text.len) {
-                        const next_len = std.unicode.utf8ByteSequenceLength(text[punct_end]) catch break;
-                        const next_slice = text[punct_end .. punct_end + next_len];
-                        const next_cp = std.unicode.utf8Decode(next_slice) catch break;
-                        if (isDigitLike(next_cp) or isLetterLike(next_cp) or isNewline(next_cp) or isHorizontalWhitespace(next_cp)) break;
-                        punct_end += next_len;
-                    }
-                    while (punct_end < text.len) {
-                        const next_len = std.unicode.utf8ByteSequenceLength(text[punct_end]) catch break;
-                        const next_slice = text[punct_end .. punct_end + next_len];
-                        const next_cp = std.unicode.utf8Decode(next_slice) catch break;
-                        if (!isNewline(next_cp)) break;
-                        punct_end += next_len;
-                    }
-                    index.* = punct_end;
-                    return text[start..punct_end];
-                }
-            }
-        }
-        index.* = end;
-        return text[start..end];
-    }
-
-    if (first_slice.len == 1 and first_slice[0] == '\'') {
-        if (matchContraction(text[start..])) |contr_len| {
-            index.* = start + contr_len;
-            return text[start..index.*];
-        }
-    }
-
-    if (isLetterLike(first_cp)) {
-        var end = start + first_len;
-        while (end < text.len) {
-            const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
-            const slice = text[end .. end + len];
-            const cp = std.unicode.utf8Decode(slice) catch break;
-            if (!isLetterLike(cp)) break;
-            end += len;
-        }
-        index.* = end;
-        return text[start..end];
-    }
-
-    if (isDigitLike(first_cp)) {
-        var end = start + first_len;
-        while (end < text.len) {
-            const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
-            const slice = text[end .. end + len];
-            const cp = std.unicode.utf8Decode(slice) catch break;
-            if (!isDigitLike(cp)) break;
-            end += len;
-        }
-        index.* = end;
-        return text[start..end];
-    }
-
-    var end = start + first_len;
-    while (end < text.len) {
-        const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
-        const slice = text[end .. end + len];
-        const cp = std.unicode.utf8Decode(slice) catch break;
-        if (isNewline(cp) or isHorizontalWhitespace(cp) or isLetterLike(cp) or isDigitLike(cp)) break;
-        end += len;
-    }
-    while (end < text.len) {
-        const len = std.unicode.utf8ByteSequenceLength(text[end]) catch break;
-        const slice = text[end .. end + len];
-        const cp = std.unicode.utf8Decode(slice) catch break;
-        if (!isNewline(cp)) break;
-        end += len;
-    }
-    index.* = end;
-    return text[start..end];
 }
 
 fn matchContraction(input: []const u8) ?usize {
