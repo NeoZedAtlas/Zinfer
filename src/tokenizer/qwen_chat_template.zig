@@ -57,6 +57,10 @@ pub fn renderMessagesPromptAlloc(
     return output.toOwnedSlice(allocator);
 }
 
+pub fn assistantHistoryContent(content: []const u8) []const u8 {
+    return stripHistoricalThinking(content);
+}
+
 fn appendRenderedMessage(
     allocator: std.mem.Allocator,
     output: *std.ArrayListUnmanaged(u8),
