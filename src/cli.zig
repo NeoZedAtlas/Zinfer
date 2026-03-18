@@ -1,5 +1,8 @@
 const std = @import("std");
 const safetensors = @import("format/safetensors.zig");
+const kv_cache = @import("model/kv_cache.zig");
+const qwen3_block = @import("model/qwen3_block.zig");
+const qwen3_model = @import("model/qwen3_model.zig");
 const qwen3_config = @import("model/qwen3_config.zig");
 const tensor_store = @import("tensor/store.zig");
 
@@ -67,6 +70,89 @@ pub fn run(allocator: std.mem.Allocator) !void {
         return error.InvalidCommand;
     }
 
+    if (std.mem.eql(u8, command, "probe-block")) {
+        if (args.len == 2) {
+            try probeBlock(allocator, default_model_dir, 0, 0, 8);
+            return;
+        }
+        if (args.len == 3) {
+            const layer_index = try std.fmt.parseInt(usize, args[2], 10);
+            try probeBlock(allocator, default_model_dir, layer_index, 0, 8);
+            return;
+        }
+        if (args.len == 4) {
+            const layer_index = try std.fmt.parseInt(usize, args[2], 10);
+            const input_index = try std.fmt.parseInt(usize, args[3], 10);
+            try probeBlock(allocator, default_model_dir, layer_index, input_index, 8);
+            return;
+        }
+        if (args.len == 5) {
+            const layer_index = try std.fmt.parseInt(usize, args[2], 10);
+            const input_index = try std.fmt.parseInt(usize, args[3], 10);
+            const count = try std.fmt.parseInt(usize, args[4], 10);
+            try probeBlock(allocator, default_model_dir, layer_index, input_index, count);
+            return;
+        }
+        if (args.len >= 6) {
+            const layer_index = try std.fmt.parseInt(usize, args[3], 10);
+            const input_index = try std.fmt.parseInt(usize, args[4], 10);
+            const count = try std.fmt.parseInt(usize, args[5], 10);
+            try probeBlock(allocator, args[2], layer_index, input_index, count);
+            return;
+        }
+        try printUsage();
+        return error.InvalidCommand;
+    }
+
+    if (std.mem.eql(u8, command, "probe-model")) {
+        if (args.len == 2) {
+            try probeModel(allocator, default_model_dir, 0, 8);
+            return;
+        }
+        if (args.len == 3) {
+            const token_id = try std.fmt.parseInt(usize, args[2], 10);
+            try probeModel(allocator, default_model_dir, token_id, 8);
+            return;
+        }
+        if (args.len == 4) {
+            const token_id = try std.fmt.parseInt(usize, args[2], 10);
+            const top_k = try std.fmt.parseInt(usize, args[3], 10);
+            try probeModel(allocator, default_model_dir, token_id, top_k);
+            return;
+        }
+        if (args.len >= 5) {
+            const token_id = try std.fmt.parseInt(usize, args[3], 10);
+            const top_k = try std.fmt.parseInt(usize, args[4], 10);
+            try probeModel(allocator, args[2], token_id, top_k);
+            return;
+        }
+        try printUsage();
+        return error.InvalidCommand;
+    }
+
+    if (std.mem.eql(u8, command, "generate-token-ids")) {
+        if (args.len == 2) {
+            try generateTokenIds(allocator, default_model_dir, "0", 5);
+            return;
+        }
+        if (args.len == 3) {
+            try generateTokenIds(allocator, default_model_dir, args[2], 5);
+            return;
+        }
+        if (args.len == 4) {
+            const steps = try std.fmt.parseInt(usize, args[3], 10);
+            try generateTokenIds(allocator, default_model_dir, args[2], steps);
+            return;
+        }
+        if (args.len >= 5) {
+            const steps = try std.fmt.parseInt(usize, args[4], 10);
+            try generateTokenIds(allocator, args[2], args[3], steps);
+            return;
+        }
+        try printUsage();
+        return error.InvalidCommand;
+    }
+
     if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try printUsage();
         return;
@@ -116,6 +202,12 @@ fn printUsage() !void {
         \\  zinfer inspect-tensor [model_dir] <tensor_name> [count]
         \\  zinfer probe-linear <tensor_name> [input_index] [rows_to_print]
         \\  zinfer probe-linear [model_dir] <tensor_name> <input_index> <rows_to_print>
+        \\  zinfer probe-block [layer_index] [input_index] [count]
+        \\  zinfer probe-block [model_dir] <layer_index> <input_index> <count>
+        \\  zinfer probe-model [token_id] [top_k]
+        \\  zinfer probe-model [model_dir] <token_id> <top_k>
+        \\  zinfer generate-token-ids [seed_ids_csv] [steps]
+        \\  zinfer generate-token-ids [model_dir] <seed_ids_csv> <steps>
         \\
         \\Defaults:
         \\  model_dir = models/Qwen3-0.6B
@@ -257,4 +349,192 @@ fn probeLinear(
         try stdout.print("{d:.6}", .{value});
     }
     try stdout.print("]\n", .{});
+}
+
+fn probeBlock(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    layer_index: usize,
+    input_index: usize,
+    count: usize,
+) !void {
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+    defer allocator.free(config_path);
+    var parsed_config = try qwen3_config.loadFromFile(allocator, config_path);
+    defer parsed_config.deinit();
+    const cfg = parsed_config.value;
+
+    if (input_index >= cfg.hidden_size) return error.InputIndexOutOfBounds;
+
+    const weights_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(weights_path);
+
+    var store = try tensor_store.TensorStore.open(allocator, weights_path);
+    defer store.deinit();
+
+    var cache = try kv_cache.LayerKVCache.init(
+        allocator,
+        1,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+    );
+    defer cache.deinit();
+
+    const hidden_in = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(hidden_in);
+    @memset(hidden_in, 0.0);
+    hidden_in[input_index] = 1.0;
+
+    const hidden_out = try allocator.alloc(f32, cfg.hidden_size);
+    defer allocator.free(hidden_out);
+
+    const spec = qwen3_block.Qwen3BlockSpec{
+        .layer_index = layer_index,
+        .hidden_size = cfg.hidden_size,
+        .intermediate_size = cfg.intermediate_size,
+        .num_attention_heads = cfg.num_attention_heads,
+        .num_key_value_heads = cfg.num_key_value_heads,
+        .head_dim = cfg.head_dim,
+        .rope_theta = @floatCast(cfg.rope_theta),
+        .rms_norm_eps = @floatCast(cfg.rms_norm_eps),
+    };
+    try qwen3_block.forwardSingleToken(allocator, &store, spec, &cache, hidden_in, hidden_out);
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("Zinfer block probe\n", .{});
+    try stdout.print("layer_index: {d}\n", .{layer_index});
+    try stdout.print("input_index: {d}\n", .{input_index});
+    try stdout.print("cache_len: {d}\n", .{cache.len});
+    try stdout.print("first_outputs: [", .{});
+    const limit = @min(count, hidden_out.len);
+    for (hidden_out[0..limit], 0..) |value, idx| {
+        if (idx != 0) try stdout.print(", ", .{});
+        try stdout.print("{d:.6}", .{value});
+    }
+    try stdout.print("]\n", .{});
+}
+
+fn probeModel(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    token_id: usize,
+    top_k: usize,
+) !void {
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+    defer allocator.free(config_path);
+    var parsed_config = try qwen3_config.loadFromFile(allocator, config_path);
+    defer parsed_config.deinit();
+    const cfg = parsed_config.value;
+
+    const weights_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(weights_path);
+
+    var store = try tensor_store.TensorStore.open(allocator, weights_path);
+    defer store.deinit();
+
+    var cache = try qwen3_model.ModelCache.init(
+        allocator,
+        cfg.num_hidden_layers,
+        1,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+    );
+    defer cache.deinit();
+
+    const logits = try qwen3_model.forwardTokenId(allocator, &store, cfg, &cache, token_id);
+    defer allocator.free(logits);
+    const top = try qwen3_model.topKLogitsAlloc(allocator, logits, top_k);
+    defer allocator.free(top);
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("Zinfer model probe\n", .{});
+    try stdout.print("token_id: {d}\n", .{token_id});
+    for (top) |entry| {
+        try stdout.print("top_logit token={d} value={d:.6}\n", .{ entry.token_id, entry.logit });
+    }
+}
+
+fn generateTokenIds(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    seed_ids_csv: []const u8,
+    steps: usize,
+) !void {
+    const seed_ids = try parseTokenIdsAlloc(allocator, seed_ids_csv);
+    defer allocator.free(seed_ids);
+    if (seed_ids.len == 0) return error.EmptySeed;
+
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+    defer allocator.free(config_path);
+    var parsed_config = try qwen3_config.loadFromFile(allocator, config_path);
+    defer parsed_config.deinit();
+    const cfg = parsed_config.value;
+
+    const weights_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(weights_path);
+
+    var store = try tensor_store.TensorStore.open(allocator, weights_path);
+    defer store.deinit();
+
+    var cache = try qwen3_model.ModelCache.init(
+        allocator,
+        cfg.num_hidden_layers,
+        seed_ids.len + steps,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+    );
+    defer cache.deinit();
+
+    const generated = try allocator.alloc(usize, seed_ids.len + steps);
+    defer allocator.free(generated);
+    @memcpy(generated[0..seed_ids.len], seed_ids);
+    var generated_len = seed_ids.len;
+
+    var last_token = seed_ids[0];
+    var last_logits: ?[]f32 = null;
+    for (seed_ids) |token_id| {
+        const logits = try qwen3_model.forwardTokenId(allocator, &store, cfg, &cache, token_id);
+        if (last_logits) |buffer| allocator.free(buffer);
+        last_logits = logits;
+        last_token = token_id;
+    }
+    defer if (last_logits) |buffer| allocator.free(buffer);
+
+    for (0..steps) |_| {
+        const current_logits = last_logits orelse return error.MissingPromptLogits;
+        const next_token = try qwen3_model.argMaxLogit(current_logits);
+        generated[generated_len] = next_token;
+        generated_len += 1;
+        last_token = next_token;
+        allocator.free(current_logits);
+        last_logits = try qwen3_model.forwardTokenId(allocator, &store, cfg, &cache, last_token);
+    }
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("Zinfer generated token ids\n", .{});
+    try stdout.print("seed: {s}\n", .{seed_ids_csv});
+    try stdout.print("steps: {d}\n", .{steps});
+    try stdout.print("tokens: [", .{});
+    for (generated[0..generated_len], 0..) |token_id, idx| {
+        if (idx != 0) try stdout.print(", ", .{});
+        try stdout.print("{d}", .{token_id});
+    }
+    try stdout.print("]\n", .{});
+}
+
+fn parseTokenIdsAlloc(
+    allocator: std.mem.Allocator,
+    csv: []const u8,
+) ![]usize {
+    var list: std.ArrayListUnmanaged(usize) = .empty;
+    defer list.deinit(allocator);
+
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " ");
+        if (trimmed.len == 0) continue;
+        try list.append(allocator, try std.fmt.parseInt(usize, trimmed, 10));
+    }
+
+    return list.toOwnedSlice(allocator);
 }

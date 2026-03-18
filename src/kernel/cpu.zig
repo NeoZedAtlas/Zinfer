@@ -47,6 +47,29 @@ pub fn rmsNorm(
     }
 }
 
+pub fn rmsNormRepeated(
+    output: []f32,
+    input: []const f32,
+    repeat_count: usize,
+    slice_len: usize,
+    weight: []const f32,
+    eps: f32,
+) !void {
+    if (weight.len != slice_len) return error.SizeMismatch;
+    if (input.len != repeat_count * slice_len) return error.SizeMismatch;
+    if (output.len != input.len) return error.SizeMismatch;
+
+    for (0..repeat_count) |idx| {
+        const start = idx * slice_len;
+        try rmsNorm(
+            output[start .. start + slice_len],
+            input[start .. start + slice_len],
+            weight,
+            eps,
+        );
+    }
+}
+
 pub fn silu(x: f32) f32 {
     return x / (1.0 + std.math.exp(-x));
 }
@@ -108,4 +131,19 @@ test "swiglu applies silu gate then multiplies up branch" {
     try testing.expectApproxEqAbs(@as(f32, 0.0), output[0], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 1.4621172), output[1], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, -0.8068243), output[2], 1e-6);
+}
+
+test "rmsNormRepeated applies same norm weight to multiple slices" {
+    const testing = std.testing;
+
+    const input = [_]f32{ 3.0, 4.0, 6.0, 8.0 };
+    const weight = [_]f32{ 1.0, 2.0 };
+    var output = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
+
+    try rmsNormRepeated(&output, &input, 2, 2, &weight, 0.0);
+
+    try testing.expectApproxEqAbs(@as(f32, 0.84852814), output[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 2.2627418), output[1], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.84852814), output[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 2.2627418), output[3], 1e-6);
 }

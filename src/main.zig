@@ -13,5 +13,8 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("kernel/cpu.zig");
     _ = @import("kernel/attention.zig");
+    _ = @import("model/kv_cache.zig");
+    _ = @import("model/qwen3_block.zig");
+    _ = @import("model/qwen3_model.zig");
     _ = @import("model/qwen3_attention.zig");
 }

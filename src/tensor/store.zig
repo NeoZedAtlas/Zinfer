@@ -56,6 +56,22 @@ pub const TensorStore = struct {
         return output;
     }
 
+    pub fn readRowAsF32Alloc(
+        self: *const TensorStore,
+        name: []const u8,
+        row_index: usize,
+    ) ![]f32 {
+        const tensor = self.getTensor(name) orelse return error.TensorNotFound;
+        if (tensor.rank() != 2) return error.InvalidTensorRank;
+
+        const rows = std.math.cast(usize, tensor.shape[0]) orelse return error.DimensionTooLarge;
+        const cols = std.math.cast(usize, tensor.shape[1]) orelse return error.DimensionTooLarge;
+        if (row_index >= rows) return error.RowIndexOutOfBounds;
+
+        const start = try std.math.mul(u64, row_index, cols);
+        return self.readElementsAsF32Alloc(name, start, cols);
+    }
+
     pub fn matmulVecByName(
         self: *const TensorStore,
         output: []f32,
