@@ -138,19 +138,15 @@ pub fn forwardSingleBlock(
 
 pub fn topKLogitsAlloc(
     allocator: std.mem.Allocator,
-    architecture: Architecture,
     values: []const f32,
     k: usize,
 ) ![]TopLogit {
-    _ = architecture;
     return try logits_util.topKLogitsAlloc(allocator, values, k);
 }
 
 pub fn argMaxLogit(
-    architecture: Architecture,
     values: []const f32,
 ) !usize {
-    _ = architecture;
     return try logits_util.argMaxLogit(values);
 }
 

@@ -2,7 +2,6 @@ const std = @import("std");
 const safetensors = @import("format/safetensors.zig");
 const kv_cache = @import("model/kv_cache.zig");
 const decoder_family = @import("model/decoder_family.zig");
-const decoder_runtime = @import("model/decoder_runtime.zig");
 const tensor_store = @import("tensor/store.zig");
 const sampler = @import("sampling/sampler.zig");
 
@@ -265,7 +264,7 @@ fn inspectConfig(allocator: std.mem.Allocator, model_dir: []const u8) !void {
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
 
-    var parsed = try decoder_runtime.loadConfigFromFile(allocator, config_path);
+    var parsed = try decoder_family.loadConfigFromFile(allocator, config_path);
     defer parsed.deinit();
 
     const cfg = parsed.value;
@@ -776,7 +775,7 @@ fn probeBlock(
 ) !void {
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
-    var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
+    var parsed_config = try decoder_family.loadConfigFromFile(allocator, config_path);
     defer parsed_config.deinit();
     const cfg = parsed_config.value;
 
@@ -828,7 +827,7 @@ fn probeModel(
 ) !void {
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
-    var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
+    var parsed_config = try decoder_family.loadConfigFromFile(allocator, config_path);
     defer parsed_config.deinit();
     const cfg = parsed_config.value;
 
@@ -838,12 +837,18 @@ fn probeModel(
     var store = try tensor_store.TensorStore.open(allocator, weights_path);
     defer store.deinit();
 
-    var cache = try decoder_runtime.ModelCache.init(allocator, cfg, 1);
+    var cache = try decoder_family.ModelCache.init(
+        allocator,
+        cfg.num_hidden_layers,
+        1,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+    );
     defer cache.deinit();
 
-    const logits = try decoder_runtime.forwardTokenId(allocator, &store, cfg, &cache, token_id);
+    const logits = try decoder_family.forwardTokenId(allocator, &store, cfg, &cache, token_id);
     defer allocator.free(logits);
-    const top = try decoder_runtime.topKLogitsAlloc(allocator, cfg, logits, top_k);
+    const top = try decoder_family.topKLogitsAlloc(allocator, logits, top_k);
     defer allocator.free(top);
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
@@ -866,7 +871,7 @@ fn generateTokenIds(
 
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
-    var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
+    var parsed_config = try decoder_family.loadConfigFromFile(allocator, config_path);
     defer parsed_config.deinit();
     const cfg = parsed_config.value;
 
@@ -876,7 +881,13 @@ fn generateTokenIds(
     var store = try tensor_store.TensorStore.open(allocator, weights_path);
     defer store.deinit();
 
-    var cache = try decoder_runtime.ModelCache.init(allocator, cfg, seed_ids.len + steps);
+    var cache = try decoder_family.ModelCache.init(
+        allocator,
+        cfg.num_hidden_layers,
+        seed_ids.len + steps,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+    );
     defer cache.deinit();
 
     const generated = try allocator.alloc(usize, seed_ids.len + steps);
@@ -887,7 +898,7 @@ fn generateTokenIds(
     var last_token = seed_ids[0];
     var last_logits: ?[]f32 = null;
     for (seed_ids) |token_id| {
-        const logits = try decoder_runtime.forwardTokenId(allocator, &store, cfg, &cache, token_id);
+        const logits = try decoder_family.forwardTokenId(allocator, &store, cfg, &cache, token_id);
         if (last_logits) |buffer| allocator.free(buffer);
         last_logits = logits;
         last_token = token_id;
@@ -896,12 +907,12 @@ fn generateTokenIds(
 
     for (0..steps) |_| {
         const current_logits = last_logits orelse return error.MissingPromptLogits;
-        const next_token = try decoder_runtime.argMaxLogit(cfg, current_logits);
+        const next_token = try decoder_family.argMaxLogit(current_logits);
         generated[generated_len] = next_token;
         generated_len += 1;
         last_token = next_token;
         allocator.free(current_logits);
-        last_logits = try decoder_runtime.forwardTokenId(allocator, &store, cfg, &cache, last_token);
+        last_logits = try decoder_family.forwardTokenId(allocator, &store, cfg, &cache, last_token);
     }
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
@@ -941,7 +952,7 @@ fn tokenizeText(
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
 
-    var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
+    var parsed_config = try decoder_family.loadConfigFromFile(allocator, config_path);
     defer parsed_config.deinit();
 
     var tokenizer = try decoder_family.loadTokenizerFromModelDir(
@@ -973,7 +984,7 @@ fn decodeIds(
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
 
-    var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
+    var parsed_config = try decoder_family.loadConfigFromFile(allocator, config_path);
     defer parsed_config.deinit();
 
     var tokenizer = try decoder_family.loadTokenizerFromModelDir(
@@ -1002,7 +1013,7 @@ fn decodeIds(
 
 fn buildSingleUserPromptAlloc(
     allocator: std.mem.Allocator,
-    architecture: decoder_runtime.Architecture,
+    architecture: decoder_family.Architecture,
     user_text: []const u8,
     system_prompt: ?[]const u8,
     thinking_mode: decoder_family.ThinkingMode,
@@ -1019,7 +1030,7 @@ fn buildSingleUserPromptAlloc(
 
 fn buildMessagesPromptAlloc(
     allocator: std.mem.Allocator,
-    architecture: decoder_runtime.Architecture,
+    architecture: decoder_family.Architecture,
     messages: []const decoder_family.Message,
     system_prompt: ?[]const u8,
     thinking_mode: decoder_family.ThinkingMode,
@@ -1278,7 +1289,7 @@ fn parseChatRole(text: []const u8) !decoder_family.Role {
 const GeneratorRuntime = struct {
     allocator: std.mem.Allocator,
     tokenizer: decoder_family.Tokenizer,
-    parsed_config: decoder_runtime.ParsedConfig,
+    parsed_config: decoder_family.ParsedConfig,
     store: tensor_store.TensorStore,
 
     fn init(allocator: std.mem.Allocator, model_dir: []const u8) !GeneratorRuntime {
@@ -1287,7 +1298,7 @@ const GeneratorRuntime = struct {
         const weights_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
         defer allocator.free(weights_path);
 
-        var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
+        var parsed_config = try decoder_family.loadConfigFromFile(allocator, config_path);
         errdefer parsed_config.deinit();
 
         var tokenizer = try decoder_family.loadTokenizerFromModelDir(
@@ -1330,17 +1341,23 @@ const GeneratorRuntime = struct {
         }
 
         const cfg = self.parsed_config.value;
-        var cache = try decoder_runtime.ModelCache.init(self.allocator, cfg, prompt_ids.len + options.max_new_tokens);
+        var cache = try decoder_family.ModelCache.init(
+            self.allocator,
+            cfg.num_hidden_layers,
+            prompt_ids.len + options.max_new_tokens,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        );
         defer cache.deinit();
 
-        const effective_stop_sequences = try decoder_runtime.effectiveStopSequencesAlloc(
+        const effective_stop_sequences = try decoder_family.effectiveStopSequencesAlloc(
             self.allocator,
-            cfg,
+            cfg.architecture,
             options.stop_sequences,
         );
         defer self.allocator.free(effective_stop_sequences);
 
-        var last_logits: ?[]f32 = try decoder_runtime.prefillTokenIds(
+        var last_logits: ?[]f32 = try decoder_family.prefillTokenIds(
             self.allocator,
             &self.store,
             cfg,
@@ -1361,7 +1378,7 @@ const GeneratorRuntime = struct {
         for (0..options.max_new_tokens) |_| {
             const current_logits = last_logits orelse return error.MissingPromptLogits;
             const next_token = try sampler.sampleToken(self.allocator, prng.random(), current_logits, history_ids.items, options.sampling);
-            if (decoder_runtime.isEosToken(cfg, next_token)) {
+            if (decoder_family.isEosToken(cfg.architecture, next_token)) {
                 self.allocator.free(current_logits);
                 last_logits = null;
                 break;
@@ -1377,7 +1394,7 @@ const GeneratorRuntime = struct {
                 return trimmed;
             }
 
-            const next_logits = try decoder_runtime.forwardTokenId(self.allocator, &self.store, cfg, &cache, next_token);
+            const next_logits = try decoder_family.forwardTokenId(self.allocator, &self.store, cfg, &cache, next_token);
             self.allocator.free(current_logits);
             last_logits = next_logits;
         }

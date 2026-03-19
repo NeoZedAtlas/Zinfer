@@ -27,7 +27,6 @@ test {
     _ = @import("model/adapters/qwen3/generation_policy.zig");
     _ = @import("model/decoder_types.zig");
     _ = @import("model/decoder_family.zig");
-    _ = @import("model/decoder_runtime.zig");
     _ = @import("model/weights_layout.zig");
     _ = @import("model/adapters/qwen3/chat_template.zig");
     _ = @import("tokenizer/bpe.zig");
