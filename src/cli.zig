@@ -2,18 +2,17 @@ const std = @import("std");
 const safetensors = @import("format/safetensors.zig");
 const kv_cache = @import("model/kv_cache.zig");
 const qwen3_block = @import("model/qwen3_block.zig");
-const qwen3_model = @import("model/qwen3_model.zig");
-const qwen3_config = @import("model/qwen3_config.zig");
+const decoder_runtime = @import("model/decoder_runtime.zig");
+const decoder_chat = @import("model/decoder_chat.zig");
 const tensor_store = @import("tensor/store.zig");
 const qwen_bpe = @import("tokenizer/qwen_bpe.zig");
-const qwen_chat_template = @import("tokenizer/qwen_chat_template.zig");
 const sampler = @import("sampling/sampler.zig");
 
 const default_model_dir = "models/Qwen3-0.6B";
 
 const GenerateOptions = struct {
     max_new_tokens: usize,
-    thinking_mode: qwen_chat_template.ThinkingMode,
+    thinking_mode: decoder_chat.ThinkingMode,
     system_prompt: ?[]const u8,
     sampling: sampler.SamplingConfig,
     seed: u64,
@@ -268,7 +267,7 @@ fn inspectConfig(allocator: std.mem.Allocator, model_dir: []const u8) !void {
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
 
-    var parsed = try qwen3_config.loadFromFile(allocator, config_path);
+    var parsed = try decoder_runtime.loadConfigFromFile(allocator, config_path);
     defer parsed.deinit();
 
     const cfg = parsed.value;
@@ -277,7 +276,7 @@ fn inspectConfig(allocator: std.mem.Allocator, model_dir: []const u8) !void {
     try stdout.print("Zinfer model inspection\n", .{});
     try stdout.print("model_dir: {s}\n", .{model_dir});
     try stdout.print("model_type: {s}\n", .{cfg.model_type});
-    try stdout.print("architectures[0]: {s}\n", .{cfg.firstArchitecture() orelse "<none>"});
+    try stdout.print("architecture: {s}\n", .{cfg.architecture.name()});
     try stdout.print("hidden_size: {d}\n", .{cfg.hidden_size});
     try stdout.print("intermediate_size: {d}\n", .{cfg.intermediate_size});
     try stdout.print("num_hidden_layers: {d}\n", .{cfg.num_hidden_layers});
@@ -480,7 +479,7 @@ fn parseChatInvocation(
     };
 }
 
-fn initGenerateOptions(mode: qwen_chat_template.ThinkingMode, max_new_tokens: usize) GenerateOptions {
+fn initGenerateOptions(mode: decoder_chat.ThinkingMode, max_new_tokens: usize) GenerateOptions {
     return .{
         .max_new_tokens = max_new_tokens,
         .thinking_mode = mode,
@@ -492,7 +491,7 @@ fn initGenerateOptions(mode: qwen_chat_template.ThinkingMode, max_new_tokens: us
     };
 }
 
-fn defaultSamplingConfig(mode: qwen_chat_template.ThinkingMode) sampler.SamplingConfig {
+fn defaultSamplingConfig(mode: decoder_chat.ThinkingMode) sampler.SamplingConfig {
     return switch (mode) {
         .enabled => .{
             .temperature = 0.6,
@@ -779,7 +778,7 @@ fn probeBlock(
 ) !void {
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
-    var parsed_config = try qwen3_config.loadFromFile(allocator, config_path);
+    var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
     defer parsed_config.deinit();
     const cfg = parsed_config.value;
 
@@ -841,7 +840,7 @@ fn probeModel(
 ) !void {
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
-    var parsed_config = try qwen3_config.loadFromFile(allocator, config_path);
+    var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
     defer parsed_config.deinit();
     const cfg = parsed_config.value;
 
@@ -851,18 +850,12 @@ fn probeModel(
     var store = try tensor_store.TensorStore.open(allocator, weights_path);
     defer store.deinit();
 
-    var cache = try qwen3_model.ModelCache.init(
-        allocator,
-        cfg.num_hidden_layers,
-        1,
-        cfg.num_key_value_heads,
-        cfg.head_dim,
-    );
+    var cache = try decoder_runtime.ModelCache.init(allocator, cfg, 1);
     defer cache.deinit();
 
-    const logits = try qwen3_model.forwardTokenId(allocator, &store, cfg, &cache, token_id);
+    const logits = try decoder_runtime.forwardTokenId(allocator, &store, cfg, &cache, token_id);
     defer allocator.free(logits);
-    const top = try qwen3_model.topKLogitsAlloc(allocator, logits, top_k);
+    const top = try decoder_runtime.topKLogitsAlloc(allocator, logits, top_k);
     defer allocator.free(top);
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
@@ -885,7 +878,7 @@ fn generateTokenIds(
 
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
-    var parsed_config = try qwen3_config.loadFromFile(allocator, config_path);
+    var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
     defer parsed_config.deinit();
     const cfg = parsed_config.value;
 
@@ -895,13 +888,7 @@ fn generateTokenIds(
     var store = try tensor_store.TensorStore.open(allocator, weights_path);
     defer store.deinit();
 
-    var cache = try qwen3_model.ModelCache.init(
-        allocator,
-        cfg.num_hidden_layers,
-        seed_ids.len + steps,
-        cfg.num_key_value_heads,
-        cfg.head_dim,
-    );
+    var cache = try decoder_runtime.ModelCache.init(allocator, cfg, seed_ids.len + steps);
     defer cache.deinit();
 
     const generated = try allocator.alloc(usize, seed_ids.len + steps);
@@ -912,7 +899,7 @@ fn generateTokenIds(
     var last_token = seed_ids[0];
     var last_logits: ?[]f32 = null;
     for (seed_ids) |token_id| {
-        const logits = try qwen3_model.forwardTokenId(allocator, &store, cfg, &cache, token_id);
+        const logits = try decoder_runtime.forwardTokenId(allocator, &store, cfg, &cache, token_id);
         if (last_logits) |buffer| allocator.free(buffer);
         last_logits = logits;
         last_token = token_id;
@@ -921,12 +908,12 @@ fn generateTokenIds(
 
     for (0..steps) |_| {
         const current_logits = last_logits orelse return error.MissingPromptLogits;
-        const next_token = try qwen3_model.argMaxLogit(current_logits);
+        const next_token = try decoder_runtime.argMaxLogit(current_logits);
         generated[generated_len] = next_token;
         generated_len += 1;
         last_token = next_token;
         allocator.free(current_logits);
-        last_logits = try qwen3_model.forwardTokenId(allocator, &store, cfg, &cache, last_token);
+        last_logits = try decoder_runtime.forwardTokenId(allocator, &store, cfg, &cache, last_token);
     }
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
@@ -1007,41 +994,43 @@ fn decodeIds(
 
 fn buildSingleUserPromptAlloc(
     allocator: std.mem.Allocator,
+    architecture: decoder_runtime.Architecture,
     user_text: []const u8,
     system_prompt: ?[]const u8,
-    thinking_mode: qwen_chat_template.ThinkingMode,
+    thinking_mode: decoder_chat.ThinkingMode,
 ) ![]u8 {
     if (system_prompt) |system| {
-        const messages = [_]qwen_chat_template.Message{
+        const messages = [_]decoder_chat.Message{
             .{ .role = .system, .content = system },
             .{ .role = .user, .content = user_text },
         };
-        return qwen_chat_template.renderMessagesPromptAlloc(allocator, &messages, thinking_mode);
+        return decoder_chat.renderMessagesPromptAlloc(allocator, architecture, &messages, thinking_mode);
     }
-    return qwen_chat_template.renderSingleUserPromptAlloc(allocator, user_text, thinking_mode);
+    return decoder_chat.renderSingleUserPromptAlloc(allocator, architecture, user_text, thinking_mode);
 }
 
 fn buildMessagesPromptAlloc(
     allocator: std.mem.Allocator,
-    messages: []const qwen_chat_template.Message,
+    architecture: decoder_runtime.Architecture,
+    messages: []const decoder_chat.Message,
     system_prompt: ?[]const u8,
-    thinking_mode: qwen_chat_template.ThinkingMode,
+    thinking_mode: decoder_chat.ThinkingMode,
 ) ![]u8 {
     if (system_prompt == null) {
-        return qwen_chat_template.renderMessagesPromptAlloc(allocator, messages, thinking_mode);
+        return decoder_chat.renderMessagesPromptAlloc(allocator, architecture, messages, thinking_mode);
     }
 
     const system = system_prompt.?;
     const needs_prepend = messages.len == 0 or messages[0].role != .system;
     if (!needs_prepend) {
-        return qwen_chat_template.renderMessagesPromptAlloc(allocator, messages, thinking_mode);
+        return decoder_chat.renderMessagesPromptAlloc(allocator, architecture, messages, thinking_mode);
     }
 
-    const expanded = try allocator.alloc(qwen_chat_template.Message, messages.len + 1);
+    const expanded = try allocator.alloc(decoder_chat.Message, messages.len + 1);
     defer allocator.free(expanded);
     expanded[0] = .{ .role = .system, .content = system };
     @memcpy(expanded[1..], messages);
-    return qwen_chat_template.renderMessagesPromptAlloc(allocator, expanded, thinking_mode);
+    return decoder_chat.renderMessagesPromptAlloc(allocator, architecture, expanded, thinking_mode);
 }
 
 const StopAnalysis = struct {
@@ -1121,7 +1110,13 @@ fn generateText(
     try stdout.print("prompt: {s}\n", .{user_text});
     try stdout.writeAll("response: ");
 
-    const prompt = try buildSingleUserPromptAlloc(allocator, user_text, options.system_prompt, options.thinking_mode);
+    const prompt = try buildSingleUserPromptAlloc(
+        allocator,
+        runtime.parsed_config.value.architecture,
+        user_text,
+        options.system_prompt,
+        options.thinking_mode,
+    );
     defer allocator.free(prompt);
 
     const response = try runtime.generateFromPrompt(prompt, options);
@@ -1150,7 +1145,13 @@ fn generateChatFromFile(
     var messages = try loadChatMessages(allocator, messages_json_path);
     defer messages.deinit();
 
-    const prompt = try buildMessagesPromptAlloc(allocator, messages.items, options.system_prompt, options.thinking_mode);
+    const prompt = try buildMessagesPromptAlloc(
+        allocator,
+        runtime.parsed_config.value.architecture,
+        messages.items,
+        options.system_prompt,
+        options.thinking_mode,
+    );
     defer allocator.free(prompt);
 
     const response = try runtime.generateFromPrompt(prompt, options);
@@ -1161,13 +1162,13 @@ fn generateChatFromFile(
     try stdout.writeAll("\n");
 }
 
-fn parseThinkingMode(text: []const u8) !qwen_chat_template.ThinkingMode {
+fn parseThinkingMode(text: []const u8) !decoder_chat.ThinkingMode {
     if (std.mem.eql(u8, text, "think")) return .enabled;
     if (std.mem.eql(u8, text, "no-think")) return .disabled;
     return error.InvalidThinkingMode;
 }
 
-fn thinkingModeName(mode: qwen_chat_template.ThinkingMode) []const u8 {
+fn thinkingModeName(mode: decoder_chat.ThinkingMode) []const u8 {
     return switch (mode) {
         .enabled => "think",
         .disabled => "no-think",
@@ -1180,11 +1181,16 @@ fn isEosToken(token_id: usize) bool {
 
 const LoadedChatMessages = struct {
     arena: std.heap.ArenaAllocator,
-    items: []qwen_chat_template.Message,
+    items: []decoder_chat.Message,
 
     fn deinit(self: *LoadedChatMessages) void {
         self.arena.deinit();
     }
+};
+
+const SessionMetadata = struct {
+    model_dir: []const u8,
+    options: GenerateOptions,
 };
 
 fn loadChatMessages(
@@ -1198,20 +1204,43 @@ fn loadChatMessages(
     const bytes = try readFileAllocAtPath(allocator, path, 1024 * 1024);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
-    if (parsed.value != .array) return error.InvalidMessagesJson;
+    const messages_value = switch (parsed.value) {
+        .array => parsed.value,
+        .object => parsed.value.object.get("messages") orelse return error.InvalidMessagesJson,
+        else => return error.InvalidMessagesJson,
+    };
+    if (messages_value != .array) return error.InvalidMessagesJson;
 
-    const messages = try allocator.alloc(qwen_chat_template.Message, parsed.value.array.items.len);
+    const messages = try allocator.alloc(decoder_chat.Message, messages_value.array.items.len);
 
-    for (parsed.value.array.items, 0..) |item, idx| {
+    for (messages_value.array.items, 0..) |item, idx| {
         if (item != .object) return error.InvalidMessagesJson;
 
         const role_value = item.object.get("role") orelse return error.InvalidMessagesJson;
         const content_value = item.object.get("content") orelse return error.InvalidMessagesJson;
         if (role_value != .string or content_value != .string) return error.InvalidMessagesJson;
 
+        var tool_calls: []const decoder_chat.ToolCall = &.{};
+        if (item.object.get("tool_calls")) |tool_calls_value| {
+            if (tool_calls_value != .array) return error.InvalidMessagesJson;
+            const parsed_tool_calls = try allocator.alloc(decoder_chat.ToolCall, tool_calls_value.array.items.len);
+            for (tool_calls_value.array.items, 0..) |tool_call_item, tool_idx| {
+                if (tool_call_item != .object) return error.InvalidMessagesJson;
+                const name_value = tool_call_item.object.get("name") orelse return error.InvalidMessagesJson;
+                const args_value = tool_call_item.object.get("arguments") orelse return error.InvalidMessagesJson;
+                if (name_value != .string or args_value != .string) return error.InvalidMessagesJson;
+                parsed_tool_calls[tool_idx] = .{
+                    .name = try allocator.dupe(u8, name_value.string),
+                    .arguments_json = try allocator.dupe(u8, args_value.string),
+                };
+            }
+            tool_calls = parsed_tool_calls;
+        }
+
         messages[idx] = .{
             .role = try parseChatRole(role_value.string),
             .content = try allocator.dupe(u8, content_value.string),
+            .tool_calls = tool_calls,
         };
     }
 
@@ -1234,17 +1263,18 @@ fn readFileAllocAtPath(
     return std.fs.cwd().readFileAlloc(allocator, path, max_bytes);
 }
 
-fn parseChatRole(text: []const u8) !qwen_chat_template.Role {
+fn parseChatRole(text: []const u8) !decoder_chat.Role {
     if (std.mem.eql(u8, text, "system")) return .system;
     if (std.mem.eql(u8, text, "user")) return .user;
     if (std.mem.eql(u8, text, "assistant")) return .assistant;
+    if (std.mem.eql(u8, text, "tool")) return .tool;
     return error.InvalidChatRole;
 }
 
 const GeneratorRuntime = struct {
     allocator: std.mem.Allocator,
     tokenizer: qwen_bpe.Tokenizer,
-    parsed_config: qwen3_config.ParsedConfig,
+    parsed_config: decoder_runtime.ParsedConfig,
     store: tensor_store.TensorStore,
 
     fn init(allocator: std.mem.Allocator, model_dir: []const u8) !GeneratorRuntime {
@@ -1256,7 +1286,7 @@ const GeneratorRuntime = struct {
         var tokenizer = try qwen_bpe.Tokenizer.loadFromModelDir(allocator, model_dir);
         errdefer tokenizer.deinit();
 
-        var parsed_config = try qwen3_config.loadFromFile(allocator, config_path);
+        var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
         errdefer parsed_config.deinit();
 
         var store = try tensor_store.TensorStore.open(allocator, weights_path);
@@ -1292,20 +1322,14 @@ const GeneratorRuntime = struct {
         }
 
         const cfg = self.parsed_config.value;
-        var cache = try qwen3_model.ModelCache.init(
-            self.allocator,
-            cfg.num_hidden_layers,
-            prompt_ids.len + options.max_new_tokens,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-        );
+        var cache = try decoder_runtime.ModelCache.init(self.allocator, cfg, prompt_ids.len + options.max_new_tokens);
         defer cache.deinit();
 
         var last_logits: ?[]f32 = null;
         defer if (last_logits) |buffer| self.allocator.free(buffer);
 
         for (prompt_ids) |token_id| {
-            const logits = try qwen3_model.forwardTokenId(self.allocator, &self.store, cfg, &cache, token_id);
+            const logits = try decoder_runtime.forwardTokenId(self.allocator, &self.store, cfg, &cache, token_id);
             if (last_logits) |buffer| self.allocator.free(buffer);
             last_logits = logits;
         }
@@ -1336,7 +1360,7 @@ const GeneratorRuntime = struct {
                 return trimmed;
             }
 
-            const next_logits = try qwen3_model.forwardTokenId(self.allocator, &self.store, cfg, &cache, next_token);
+            const next_logits = try decoder_runtime.forwardTokenId(self.allocator, &self.store, cfg, &cache, next_token);
             self.allocator.free(current_logits);
             last_logits = next_logits;
         }
@@ -1399,7 +1423,7 @@ fn chatLoop(
         if (std.mem.startsWith(u8, line, "/save ")) {
             const path = std.mem.trim(u8, line["/save ".len..], " ");
             if (path.len == 0) return error.MissingFlagValue;
-            try history.saveToFile(path);
+            try history.saveToFile(path, .{ .model_dir = model_dir, .options = options });
             try stdout.print("saved: {s}\n", .{path});
             continue;
         }
@@ -1416,7 +1440,7 @@ fn chatLoop(
 
         try history.append(.user, line);
 
-        const prompt = try qwen_chat_template.renderMessagesPromptAlloc(allocator, history.items(), options.thinking_mode);
+        const prompt = try decoder_chat.renderMessagesPromptAlloc(allocator, runtime.parsed_config.value.architecture, history.items(), options.thinking_mode);
         defer allocator.free(prompt);
 
         try stdout.writeAll("assistant> ");
@@ -1427,17 +1451,17 @@ fn chatLoop(
             try stdout.print("{s}", .{response});
         }
         try stdout.writeAll("\n");
-        try history.append(.assistant, qwen_chat_template.assistantHistoryContent(response));
+        try history.append(.assistant, decoder_chat.assistantHistoryContent(runtime.parsed_config.value.architecture, response));
     }
 
     if (save_path) |path| {
-        try history.saveToFile(path);
+        try history.saveToFile(path, .{ .model_dir = model_dir, .options = options });
     }
 }
 
 const ChatHistory = struct {
     allocator: std.mem.Allocator,
-    messages: std.ArrayListUnmanaged(qwen_chat_template.Message),
+    messages: std.ArrayListUnmanaged(decoder_chat.Message),
 
     fn init(allocator: std.mem.Allocator) ChatHistory {
         return .{
@@ -1454,16 +1478,62 @@ const ChatHistory = struct {
     fn clear(self: *ChatHistory) void {
         for (self.messages.items) |message| {
             self.allocator.free(message.content);
+            if (message.tool_calls.len != 0) {
+                for (message.tool_calls) |tool_call| {
+                    self.allocator.free(tool_call.name);
+                    self.allocator.free(tool_call.arguments_json);
+                }
+                self.allocator.free(message.tool_calls);
+            }
         }
         self.messages.clearRetainingCapacity();
     }
 
-    fn append(self: *ChatHistory, role: qwen_chat_template.Role, content: []const u8) !void {
-        const owned = try self.allocator.dupe(u8, content);
-        errdefer self.allocator.free(owned);
-        try self.messages.append(self.allocator, .{
+    fn append(self: *ChatHistory, role: decoder_chat.Role, content: []const u8) !void {
+        try self.appendMessage(.{
             .role = role,
-            .content = owned,
+            .content = content,
+        });
+    }
+
+    fn appendMessage(self: *ChatHistory, message: decoder_chat.Message) !void {
+        const owned_content = try self.allocator.dupe(u8, message.content);
+        errdefer self.allocator.free(owned_content);
+
+        var owned_tool_calls: []const decoder_chat.ToolCall = &.{};
+        if (message.tool_calls.len != 0) {
+            const copied = try self.allocator.alloc(decoder_chat.ToolCall, message.tool_calls.len);
+            errdefer self.allocator.free(copied);
+
+            var copied_len: usize = 0;
+            errdefer {
+                for (copied[0..copied_len]) |tool_call| {
+                    self.allocator.free(tool_call.name);
+                    self.allocator.free(tool_call.arguments_json);
+                }
+            }
+
+            for (message.tool_calls, 0..) |tool_call, idx| {
+                copied[idx] = .{
+                    .name = try self.allocator.dupe(u8, tool_call.name),
+                    .arguments_json = try self.allocator.dupe(u8, tool_call.arguments_json),
+                };
+                copied_len += 1;
+            }
+            owned_tool_calls = copied;
+        }
+        errdefer if (owned_tool_calls.len != 0) {
+            for (owned_tool_calls) |tool_call| {
+                self.allocator.free(tool_call.name);
+                self.allocator.free(tool_call.arguments_json);
+            }
+            self.allocator.free(owned_tool_calls);
+        };
+
+        try self.messages.append(self.allocator, .{
+            .role = message.role,
+            .content = owned_content,
+            .tool_calls = owned_tool_calls,
         });
     }
 
@@ -1478,7 +1548,7 @@ const ChatHistory = struct {
         });
     }
 
-    fn saveToFile(self: *const ChatHistory, path: []const u8) !void {
+    fn saveToFile(self: *const ChatHistory, path: []const u8, metadata: SessionMetadata) !void {
         const file = if (std.fs.path.isAbsolute(path))
             try std.fs.createFileAbsolute(path, .{ .truncate = true })
         else
@@ -1486,16 +1556,87 @@ const ChatHistory = struct {
         defer file.close();
         const writer = file.deprecatedWriter();
 
-        try writer.writeAll("[\n");
+        try writer.writeAll("{\n");
+        try writer.writeAll("  \"version\": 1,\n");
+        try writer.writeAll("  \"kind\": \"zinfer_chat_session\",\n");
+        try writer.writeAll("  \"saved_unix\": ");
+        try writer.print("{d}", .{std.time.timestamp()});
+        try writer.writeAll(",\n");
+        try writer.writeAll("  \"model_dir\": ");
+        try writer.print("{f}", .{std.json.fmt(metadata.model_dir, .{})});
+        try writer.writeAll(",\n");
+        try writer.writeAll("  \"options\": {\n");
+        try writer.writeAll("    \"thinking_mode\": ");
+        try writer.print("{f}", .{std.json.fmt(thinkingModeName(metadata.options.thinking_mode), .{})});
+        try writer.writeAll(",\n");
+        try writer.writeAll("    \"max_new_tokens\": ");
+        try writer.print("{d}", .{metadata.options.max_new_tokens});
+        try writer.writeAll(",\n");
+        try writer.writeAll("    \"seed\": ");
+        try writer.print("{d}", .{metadata.options.seed});
+        try writer.writeAll(",\n");
+        try writer.writeAll("    \"stream_output\": ");
+        try writer.writeAll(if (metadata.options.stream_output) "true" else "false");
+        try writer.writeAll(",\n");
+        try writer.writeAll("    \"system_prompt\": ");
+        if (metadata.options.system_prompt) |system_prompt| {
+            try writer.print("{f}", .{std.json.fmt(system_prompt, .{})});
+        } else {
+            try writer.writeAll("null");
+        }
+        try writer.writeAll(",\n");
+        try writer.writeAll("    \"sampling\": {\n");
+        try writer.writeAll("      \"temperature\": ");
+        try writer.print("{d}", .{metadata.options.sampling.temperature});
+        try writer.writeAll(",\n");
+        try writer.writeAll("      \"top_p\": ");
+        try writer.print("{d}", .{metadata.options.sampling.top_p});
+        try writer.writeAll(",\n");
+        try writer.writeAll("      \"top_k\": ");
+        try writer.print("{d}", .{metadata.options.sampling.top_k});
+        try writer.writeAll(",\n");
+        try writer.writeAll("      \"min_p\": ");
+        try writer.print("{d}", .{metadata.options.sampling.min_p});
+        try writer.writeAll(",\n");
+        try writer.writeAll("      \"presence_penalty\": ");
+        try writer.print("{d}", .{metadata.options.sampling.presence_penalty});
+        try writer.writeAll(",\n");
+        try writer.writeAll("      \"frequency_penalty\": ");
+        try writer.print("{d}", .{metadata.options.sampling.frequency_penalty});
+        try writer.writeAll(",\n");
+        try writer.writeAll("      \"repetition_penalty\": ");
+        try writer.print("{d}", .{metadata.options.sampling.repetition_penalty});
+        try writer.writeAll("\n");
+        try writer.writeAll("    },\n");
+        try writer.writeAll("    \"stop_sequences\": [");
+        for (metadata.options.stop_sequences, 0..) |stop_sequence, idx| {
+            if (idx != 0) try writer.writeAll(", ");
+            try writer.print("{f}", .{std.json.fmt(stop_sequence, .{})});
+        }
+        try writer.writeAll("]\n");
+        try writer.writeAll("  },\n");
+        try writer.writeAll("  \"messages\": [\n");
         for (self.messages.items, 0..) |message, idx| {
             if (idx != 0) try writer.writeAll(",\n");
             try writer.writeAll("  {\"role\": ");
             try writer.print("{f}", .{std.json.fmt(message.role.name(), .{})});
             try writer.writeAll(", \"content\": ");
             try writer.print("{f}", .{std.json.fmt(message.content, .{})});
+            if (message.tool_calls.len != 0) {
+                try writer.writeAll(", \"tool_calls\": [");
+                for (message.tool_calls, 0..) |tool_call, tool_idx| {
+                    if (tool_idx != 0) try writer.writeAll(", ");
+                    try writer.writeAll("{\"name\": ");
+                    try writer.print("{f}", .{std.json.fmt(tool_call.name, .{})});
+                    try writer.writeAll(", \"arguments\": ");
+                    try writer.print("{f}", .{std.json.fmt(tool_call.arguments_json, .{})});
+                    try writer.writeAll("}");
+                }
+                try writer.writeAll("]");
+            }
             try writer.writeAll("}");
         }
-        try writer.writeAll("\n]\n");
+        try writer.writeAll("\n  ]\n}\n");
     }
 
     fn loadFromFile(self: *ChatHistory, path: []const u8) !void {
@@ -1505,11 +1646,11 @@ const ChatHistory = struct {
         defer loaded.deinit();
 
         for (loaded.items) |message| {
-            try self.append(message.role, message.content);
+            try self.appendMessage(message);
         }
     }
 
-    fn items(self: *const ChatHistory) []const qwen_chat_template.Message {
+    fn items(self: *const ChatHistory) []const decoder_chat.Message {
         return self.messages.items;
     }
 };
@@ -1532,4 +1673,62 @@ test "analyzeGeneratedText holds back partial stop prefix" {
     try testing.expect(!analysis.stop_hit);
     try testing.expectEqual(@as(usize, 6), analysis.printable_len);
     try testing.expectEqual(@as(usize, 8), analysis.response_len);
+}
+
+test "chat history session save and load preserves tool calls" {
+    const testing = std.testing;
+
+    var temp_dir = testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+
+    const temp_root = try temp_dir.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(temp_root);
+    const session_path = try std.fs.path.join(testing.allocator, &.{ temp_root, "session.json" });
+    defer testing.allocator.free(session_path);
+
+    var history = ChatHistory.init(testing.allocator);
+    defer history.deinit();
+
+    try history.append(.system, "You are terse.");
+    try history.append(.user, "Use the weather tool.");
+    try history.appendMessage(.{
+        .role = .assistant,
+        .content = "",
+        .tool_calls = &[_]decoder_chat.ToolCall{
+            .{ .name = "lookup_weather", .arguments_json = "{\"city\":\"Shanghai\"}" },
+        },
+    });
+    try history.append(.tool, "{\"temp\":22}");
+
+    const stop_sequences = [_][]const u8{"</tool_response>"};
+    try history.saveToFile(session_path, .{
+        .model_dir = "models/Qwen3-0.6B",
+        .options = .{
+            .max_new_tokens = 64,
+            .thinking_mode = .disabled,
+            .system_prompt = "You are terse.",
+            .sampling = defaultSamplingConfig(.disabled),
+            .seed = 7,
+            .stream_output = true,
+            .stop_sequences = @constCast(stop_sequences[0..]),
+        },
+    });
+
+    const saved = try readFileAllocAtPath(testing.allocator, session_path, 64 * 1024);
+    defer testing.allocator.free(saved);
+    try testing.expect(std.mem.indexOf(u8, saved, "\"kind\": \"zinfer_chat_session\"") != null);
+    try testing.expect(std.mem.indexOf(u8, saved, "\"tool_calls\"") != null);
+    try testing.expect(std.mem.indexOf(u8, saved, "\"model_dir\": \"models/Qwen3-0.6B\"") != null);
+
+    var loaded = ChatHistory.init(testing.allocator);
+    defer loaded.deinit();
+    try loaded.loadFromFile(session_path);
+
+    try testing.expectEqual(@as(usize, 4), loaded.items().len);
+    try testing.expectEqual(decoder_chat.Role.system, loaded.items()[0].role);
+    try testing.expectEqual(decoder_chat.Role.assistant, loaded.items()[2].role);
+    try testing.expectEqual(decoder_chat.Role.tool, loaded.items()[3].role);
+    try testing.expectEqual(@as(usize, 1), loaded.items()[2].tool_calls.len);
+    try testing.expectEqualStrings("lookup_weather", loaded.items()[2].tool_calls[0].name);
+    try testing.expectEqualStrings("{\"city\":\"Shanghai\"}", loaded.items()[2].tool_calls[0].arguments_json);
 }
