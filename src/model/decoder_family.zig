@@ -208,6 +208,10 @@ pub fn commonWeights(architecture: Architecture) CommonWeights {
     return entryForArchitecture(architecture).common_weights;
 }
 
+pub fn layerLayout(architecture: Architecture) generic_block.LayerLayout {
+    return entryForArchitecture(architecture).layer_layout;
+}
+
 pub fn layerTensorNameAlloc(
     allocator: std.mem.Allocator,
     architecture: Architecture,

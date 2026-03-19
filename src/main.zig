@@ -27,8 +27,11 @@ test {
     _ = @import("model/adapters/qwen3/generation_policy.zig");
     _ = @import("model/decoder_types.zig");
     _ = @import("model/decoder_family.zig");
+    _ = @import("model/optimized_decoder.zig");
     _ = @import("model/weights_layout.zig");
     _ = @import("model/adapters/qwen3/chat_template.zig");
+    _ = @import("tensor/backend.zig");
     _ = @import("tokenizer/bpe.zig");
+    _ = @import("tensor/quantized.zig");
     _ = @import("sampling/sampler.zig");
 }

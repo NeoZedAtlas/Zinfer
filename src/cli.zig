@@ -2,6 +2,8 @@ const std = @import("std");
 const safetensors = @import("format/safetensors.zig");
 const kv_cache = @import("model/kv_cache.zig");
 const decoder_family = @import("model/decoder_family.zig");
+const optimized_decoder = @import("model/optimized_decoder.zig");
+const quantized = @import("tensor/quantized.zig");
 const tensor_store = @import("tensor/store.zig");
 const sampler = @import("sampling/sampler.zig");
 
@@ -197,6 +199,38 @@ pub fn run(allocator: std.mem.Allocator) !void {
         return error.InvalidCommand;
     }
 
+    if (std.mem.eql(u8, command, "bench")) {
+        if (args.len == 3) {
+            try benchPrompt(allocator, default_model_dir, args[2], 16);
+            return;
+        }
+        if (args.len == 4) {
+            const max_new_tokens = try std.fmt.parseInt(usize, args[3], 10);
+            try benchPrompt(allocator, default_model_dir, args[2], max_new_tokens);
+            return;
+        }
+        if (args.len >= 5) {
+            const max_new_tokens = try std.fmt.parseInt(usize, args[4], 10);
+            try benchPrompt(allocator, args[2], args[3], max_new_tokens);
+            return;
+        }
+        try printUsage();
+        return error.InvalidCommand;
+    }
+
+    if (std.mem.eql(u8, command, "quantize")) {
+        if (args.len == 3) {
+            try quantizeModelDir(allocator, default_model_dir, args[2]);
+            return;
+        }
+        if (args.len >= 4) {
+            try quantizeModelDir(allocator, args[3], args[2]);
+            return;
+        }
+        try printUsage();
+        return error.InvalidCommand;
+    }
+
     if (std.mem.eql(u8, command, "tokenize")) {
         if (args.len == 3) {
             try tokenizeText(allocator, default_model_dir, args[2]);
@@ -305,6 +339,10 @@ fn printUsage() !void {
         \\  zinfer probe-model [model_dir] <token_id> <top_k>
         \\  zinfer generate-token-ids [seed_ids_csv] [steps]
         \\  zinfer generate-token-ids [model_dir] <seed_ids_csv> <steps>
+        \\  zinfer bench <text> [max_new_tokens]
+        \\  zinfer bench [model_dir] <text> <max_new_tokens>
+        \\  zinfer quantize <q8|q4>
+        \\  zinfer quantize <q8|q4> [model_dir]
         \\  zinfer tokenize <text>
         \\  zinfer tokenize [model_dir] <text>
         \\  zinfer decode-ids <ids_csv>
@@ -927,6 +965,112 @@ fn generateTokenIds(
     try stdout.print("]\n", .{});
 }
 
+fn benchPrompt(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    user_text: []const u8,
+    max_new_tokens: usize,
+) !void {
+    var runtime = try GeneratorRuntime.init(allocator, model_dir);
+    defer runtime.deinit();
+    const cfg = runtime.model.cfg;
+
+    const prompt = try buildSingleUserPromptAlloc(allocator, cfg.architecture, user_text, null, .disabled);
+    defer allocator.free(prompt);
+
+    var tokenize_timer = try std.time.Timer.start();
+    const prompt_ids_u32 = try runtime.tokenizer.encodeAlloc(allocator, prompt);
+    defer allocator.free(prompt_ids_u32);
+    const tokenize_ns = tokenize_timer.read();
+    if (prompt_ids_u32.len == 0) return error.EmptyPrompt;
+
+    const prompt_ids = try allocator.alloc(usize, prompt_ids_u32.len);
+    defer allocator.free(prompt_ids);
+    for (prompt_ids_u32, 0..) |token_id, idx| {
+        prompt_ids[idx] = token_id;
+    }
+
+    var cache = try decoder_family.ModelCache.init(
+        allocator,
+        cfg.num_hidden_layers,
+        prompt_ids.len + max_new_tokens,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+    );
+    defer cache.deinit();
+    var workspace = try runtime.model.initWorkspace(prompt_ids.len + max_new_tokens);
+    defer workspace.deinit();
+
+    var prefill_timer = try std.time.Timer.start();
+    const last_logits = try runtime.model.prefillTokenIds(&workspace, &cache, prompt_ids);
+    const prefill_ns = prefill_timer.read();
+
+    var decode_timer = try std.time.Timer.start();
+    var decoded_tokens: usize = 0;
+    var current_logits = last_logits;
+    for (0..max_new_tokens) |_| {
+        const next_token = try decoder_family.argMaxLogit(current_logits);
+        if (decoder_family.isEosToken(cfg.architecture, next_token)) {
+            break;
+        }
+
+        current_logits = try runtime.model.forwardTokenId(&workspace, &cache, next_token);
+        decoded_tokens += 1;
+    }
+    const decode_ns = decode_timer.read();
+
+    const weights_size = try weightArtifactSize(allocator, model_dir, runtime.model.backendName());
+    const kv_cache_bytes = estimateKvCacheBytes(cfg, prompt_ids.len + max_new_tokens);
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("Zinfer benchmark\n", .{});
+    try stdout.print("model_dir: {s}\n", .{model_dir});
+    try stdout.print("backend: {s}\n", .{runtime.model.backendName()});
+    try stdout.print("prompt_tokens: {d}\n", .{prompt_ids.len});
+    try stdout.print("decode_tokens: {d}\n", .{decoded_tokens});
+    try stdout.print("tokenize_ms: {d:.3}\n", .{nsToMs(tokenize_ns)});
+    try stdout.print("prefill_ms: {d:.3}\n", .{nsToMs(prefill_ns)});
+    try stdout.print("decode_ms: {d:.3}\n", .{nsToMs(decode_ns)});
+    try stdout.print("prefill_tok_s: {d:.3}\n", .{tokensPerSecond(prompt_ids.len, prefill_ns)});
+    try stdout.print("decode_tok_s: {d:.3}\n", .{tokensPerSecond(decoded_tokens, decode_ns)});
+    try stdout.print("weights_bytes: {d}\n", .{weights_size});
+    try stdout.print("weights_mib: {d:.3}\n", .{bytesToMiB(weights_size)});
+    try stdout.print("kv_cache_bytes: {d}\n", .{kv_cache_bytes});
+    try stdout.print("kv_cache_mib: {d:.3}\n", .{bytesToMiB(kv_cache_bytes)});
+}
+
+fn quantizeModelDir(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    scheme_text: []const u8,
+) !void {
+    const scheme: quantized.Scheme = if (std.mem.eql(u8, scheme_text, "q8"))
+        .q8
+    else if (std.mem.eql(u8, scheme_text, "q4"))
+        .q4
+    else
+        return error.InvalidQuantizationScheme;
+
+    const input_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
+    defer allocator.free(input_path);
+    const output_path = try std.fs.path.join(allocator, &.{ model_dir, scheme.fileName() });
+    defer allocator.free(output_path);
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("Zinfer quantize\n", .{});
+    try stdout.print("model_dir: {s}\n", .{model_dir});
+    try stdout.print("scheme: {s}\n", .{scheme.name()});
+    try stdout.print("output: {s}\n", .{output_path});
+
+    var timer = try std.time.Timer.start();
+    try quantized.quantizeModel(allocator, input_path, output_path, scheme);
+    const elapsed_ns = timer.read();
+    const output_size = try fileSizeAtPath(output_path);
+
+    try stdout.print("elapsed_ms: {d:.3}\n", .{nsToMs(elapsed_ns)});
+    try stdout.print("output_bytes: {d}\n", .{output_size});
+    try stdout.print("output_mib: {d:.3}\n", .{bytesToMiB(output_size)});
+}
+
 fn parseTokenIdsAlloc(
     allocator: std.mem.Allocator,
     csv: []const u8,
@@ -942,6 +1086,51 @@ fn parseTokenIdsAlloc(
     }
 
     return list.toOwnedSlice(allocator);
+}
+
+fn fileSizeAtPath(path: []const u8) !u64 {
+    const file = if (std.fs.path.isAbsolute(path))
+        try std.fs.openFileAbsolute(path, .{})
+    else
+        try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    const stat = try file.stat();
+    return stat.size;
+}
+
+fn weightArtifactSize(allocator: std.mem.Allocator, model_dir: []const u8, backend_name: []const u8) !u64 {
+    const file_name = if (std.mem.eql(u8, backend_name, "q4"))
+        "model.q4.zinfer"
+    else if (std.mem.eql(u8, backend_name, "q8"))
+        "model.q8.zinfer"
+    else
+        "model.safetensors";
+    const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
+    defer allocator.free(path);
+    return fileSizeAtPath(path);
+}
+
+fn estimateKvCacheBytes(cfg: decoder_family.DecoderConfig, max_seq_len: usize) u64 {
+    const total = @as(u128, cfg.num_hidden_layers) *
+        @as(u128, max_seq_len) *
+        @as(u128, cfg.num_key_value_heads) *
+        @as(u128, cfg.head_dim) *
+        2 *
+        @sizeOf(f32);
+    return @intCast(total);
+}
+
+fn nsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
+
+fn bytesToMiB(bytes: u64) f64 {
+    return @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+}
+
+fn tokensPerSecond(token_count: usize, elapsed_ns: u64) f64 {
+    if (token_count == 0 or elapsed_ns == 0) return 0.0;
+    return @as(f64, @floatFromInt(token_count)) * 1_000_000_000.0 / @as(f64, @floatFromInt(elapsed_ns));
 }
 
 fn tokenizeText(
@@ -1131,7 +1320,7 @@ fn generateText(
 
     const prompt = try buildSingleUserPromptAlloc(
         allocator,
-        runtime.parsed_config.value.architecture,
+        runtime.model.cfg.architecture,
         user_text,
         options.system_prompt,
         options.thinking_mode,
@@ -1166,7 +1355,7 @@ fn generateChatFromFile(
 
     const prompt = try buildMessagesPromptAlloc(
         allocator,
-        runtime.parsed_config.value.architecture,
+        runtime.model.cfg.architecture,
         messages.items,
         options.system_prompt,
         options.thinking_mode,
@@ -1289,17 +1478,13 @@ fn parseChatRole(text: []const u8) !decoder_family.Role {
 const GeneratorRuntime = struct {
     allocator: std.mem.Allocator,
     tokenizer: decoder_family.Tokenizer,
-    parsed_config: decoder_family.ParsedConfig,
-    store: tensor_store.TensorStore,
+    model: optimized_decoder.Runtime,
 
     fn init(allocator: std.mem.Allocator, model_dir: []const u8) !GeneratorRuntime {
         const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
         defer allocator.free(config_path);
-        const weights_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
-        defer allocator.free(weights_path);
-
         var parsed_config = try decoder_family.loadConfigFromFile(allocator, config_path);
-        errdefer parsed_config.deinit();
+        defer parsed_config.deinit();
 
         var tokenizer = try decoder_family.loadTokenizerFromModelDir(
             allocator,
@@ -1308,20 +1493,18 @@ const GeneratorRuntime = struct {
         );
         errdefer tokenizer.deinit();
 
-        var store = try tensor_store.TensorStore.open(allocator, weights_path);
-        errdefer store.deinit();
+        var model = try optimized_decoder.Runtime.init(allocator, model_dir, .auto, null);
+        errdefer model.deinit();
 
         return .{
             .allocator = allocator,
             .tokenizer = tokenizer,
-            .parsed_config = parsed_config,
-            .store = store,
+            .model = model,
         };
     }
 
     fn deinit(self: *GeneratorRuntime) void {
-        self.store.deinit();
-        self.parsed_config.deinit();
+        self.model.deinit();
         self.tokenizer.deinit();
     }
 
@@ -1340,7 +1523,7 @@ const GeneratorRuntime = struct {
             prompt_ids[idx] = token_id;
         }
 
-        const cfg = self.parsed_config.value;
+        const cfg = self.model.cfg;
         var cache = try decoder_family.ModelCache.init(
             self.allocator,
             cfg.num_hidden_layers,
@@ -1349,6 +1532,8 @@ const GeneratorRuntime = struct {
             cfg.head_dim,
         );
         defer cache.deinit();
+        var workspace = try self.model.initWorkspace(prompt_ids.len + options.max_new_tokens);
+        defer workspace.deinit();
 
         const effective_stop_sequences = try decoder_family.effectiveStopSequencesAlloc(
             self.allocator,
@@ -1357,14 +1542,7 @@ const GeneratorRuntime = struct {
         );
         defer self.allocator.free(effective_stop_sequences);
 
-        var last_logits: ?[]f32 = try decoder_family.prefillTokenIds(
-            self.allocator,
-            &self.store,
-            cfg,
-            &cache,
-            prompt_ids,
-        );
-        defer if (last_logits) |buffer| self.allocator.free(buffer);
+        var current_logits = try self.model.prefillTokenIds(&workspace, &cache, prompt_ids);
 
         var generated = std.ArrayListUnmanaged(u32).empty;
         defer generated.deinit(self.allocator);
@@ -1376,11 +1554,8 @@ const GeneratorRuntime = struct {
         var streamed_len: usize = 0;
         var prng = std.Random.DefaultPrng.init(options.seed);
         for (0..options.max_new_tokens) |_| {
-            const current_logits = last_logits orelse return error.MissingPromptLogits;
             const next_token = try sampler.sampleToken(self.allocator, prng.random(), current_logits, history_ids.items, options.sampling);
             if (decoder_family.isEosToken(cfg.architecture, next_token)) {
-                self.allocator.free(current_logits);
-                last_logits = null;
                 break;
             }
 
@@ -1389,14 +1564,10 @@ const GeneratorRuntime = struct {
             var effective_options = options;
             effective_options.stop_sequences = effective_stop_sequences;
             if (try analyzeAndMaybeStream(self.allocator, &self.tokenizer, generated.items, effective_options, stdout, &streamed_len)) |trimmed| {
-                self.allocator.free(current_logits);
-                last_logits = null;
                 return trimmed;
             }
 
-            const next_logits = try decoder_family.forwardTokenId(self.allocator, &self.store, cfg, &cache, next_token);
-            self.allocator.free(current_logits);
-            last_logits = next_logits;
+            current_logits = try self.model.forwardTokenId(&workspace, &cache, next_token);
         }
 
         const response = try self.tokenizer.decodeAlloc(self.allocator, generated.items);
@@ -1474,7 +1645,7 @@ fn chatLoop(
 
         try history.append(.user, line);
 
-        const prompt = try decoder_family.renderMessagesPromptAlloc(allocator, runtime.parsed_config.value.architecture, history.items(), options.thinking_mode);
+        const prompt = try decoder_family.renderMessagesPromptAlloc(allocator, runtime.model.cfg.architecture, history.items(), options.thinking_mode);
         defer allocator.free(prompt);
 
         try stdout.writeAll("assistant> ");
@@ -1485,7 +1656,7 @@ fn chatLoop(
             try stdout.print("{s}", .{response});
         }
         try stdout.writeAll("\n");
-        try history.append(.assistant, decoder_family.assistantHistoryContent(runtime.parsed_config.value.architecture, response));
+        try history.append(.assistant, decoder_family.assistantHistoryContent(runtime.model.cfg.architecture, response));
     }
 
     if (save_path) |path| {

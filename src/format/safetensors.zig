@@ -185,6 +185,54 @@ pub fn parseFromFileHandle(backing_allocator: std.mem.Allocator, file: std.fs.Fi
     };
 }
 
+pub fn parseFromBytes(backing_allocator: std.mem.Allocator, bytes: []const u8) !ParsedFile {
+    var arena = std.heap.ArenaAllocator.init(backing_allocator);
+    errdefer arena.deinit();
+
+    const allocator = arena.allocator();
+    if (bytes.len < 8) return error.InvalidSafetensorsFile;
+
+    const file_size = bytes.len;
+    const header_len = std.mem.readInt(u64, bytes[0..8], .little);
+    const data_start = try std.math.add(u64, 8, header_len);
+    if (data_start > file_size) return error.InvalidHeaderLength;
+
+    const header_len_usize = std.math.cast(usize, header_len) orelse return error.HeaderTooLarge;
+    if (8 + header_len_usize > bytes.len) return error.InvalidSafetensorsFile;
+    const header_json = std.mem.trimRight(u8, bytes[8 .. 8 + header_len_usize], " ");
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, allocator, header_json, .{});
+    if (root != .object) return error.InvalidHeaderJson;
+
+    var metadata: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    var tensors: std.StringArrayHashMapUnmanaged(TensorInfo) = .empty;
+
+    var it = root.object.iterator();
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        const value = entry.value_ptr.*;
+
+        if (std.mem.eql(u8, key, "__metadata__")) {
+            try parseMetadataObject(allocator, &metadata, value);
+            continue;
+        }
+
+        const tensor = try parseTensorInfo(allocator, value, data_start);
+        try tensors.put(allocator, key, tensor);
+    }
+
+    const data_section_len = std.math.sub(u64, file_size, data_start) catch return error.InvalidSafetensorsFile;
+    try validateDataLayout(allocator, tensors, data_section_len);
+
+    return .{
+        .arena = arena,
+        .file_size = file_size,
+        .header_len = header_len,
+        .data_start = data_start,
+        .metadata = metadata,
+        .tensors = tensors,
+    };
+}
+
 fn parseMetadataObject(
     allocator: std.mem.Allocator,
     metadata: *std.StringArrayHashMapUnmanaged([]const u8),
