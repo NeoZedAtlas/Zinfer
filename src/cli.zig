@@ -1,7 +1,7 @@
 const std = @import("std");
 const safetensors = @import("format/safetensors.zig");
 const kv_cache = @import("model/kv_cache.zig");
-const qwen3_block = @import("model/qwen3_block.zig");
+const adapter_block = @import("model/adapters/qwen3/block.zig");
 const decoder_family = @import("model/decoder_family.zig");
 const decoder_runtime = @import("model/decoder_runtime.zig");
 const tensor_store = @import("tensor/store.zig");
@@ -805,7 +805,7 @@ fn probeBlock(
     const hidden_out = try allocator.alloc(f32, cfg.hidden_size);
     defer allocator.free(hidden_out);
 
-    const spec = qwen3_block.Qwen3BlockSpec{
+    const spec = adapter_block.BlockSpec{
         .layer_index = layer_index,
         .hidden_size = cfg.hidden_size,
         .intermediate_size = cfg.intermediate_size,
@@ -815,7 +815,7 @@ fn probeBlock(
         .rope_theta = @floatCast(cfg.rope_theta),
         .rms_norm_eps = @floatCast(cfg.rms_norm_eps),
     };
-    try qwen3_block.forwardSingleToken(allocator, &store, spec, &cache, hidden_in, hidden_out);
+    try adapter_block.forwardSingleToken(allocator, &store, spec, &cache, hidden_in, hidden_out);
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("Zinfer block probe\n", .{});

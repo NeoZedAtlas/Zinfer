@@ -1,9 +1,9 @@
 const std = @import("std");
-const cpu = @import("../kernel/cpu.zig");
-const kv_cache = @import("kv_cache.zig");
-const qwen3_block = @import("qwen3_block.zig");
-const qwen3_config = @import("qwen3_config.zig");
-const tensor_store = @import("../tensor/store.zig");
+const cpu = @import("../../../kernel/cpu.zig");
+const kv_cache = @import("../../kv_cache.zig");
+const adapter_block = @import("block.zig");
+const adapter_config = @import("config.zig");
+const tensor_store = @import("../../../tensor/store.zig");
 
 pub const ModelCache = struct {
     allocator: std.mem.Allocator,
@@ -46,7 +46,7 @@ pub const TopLogit = struct {
 pub fn forwardTokenId(
     allocator: std.mem.Allocator,
     store: *const tensor_store.TensorStore,
-    cfg: qwen3_config.Qwen3Config,
+    cfg: adapter_config.Config,
     cache: *ModelCache,
     token_id: usize,
 ) ![]f32 {
@@ -60,7 +60,7 @@ pub fn forwardTokenId(
     defer allocator.free(scratch);
 
     for (0..cfg.num_hidden_layers) |layer_index| {
-        const spec = qwen3_block.Qwen3BlockSpec{
+        const spec = adapter_block.BlockSpec{
             .layer_index = layer_index,
             .hidden_size = cfg.hidden_size,
             .intermediate_size = cfg.intermediate_size,
@@ -70,7 +70,7 @@ pub fn forwardTokenId(
             .rope_theta = @floatCast(cfg.rope_theta),
             .rms_norm_eps = @floatCast(cfg.rms_norm_eps),
         };
-        try qwen3_block.forwardSingleToken(allocator, store, spec, &cache.layers[layer_index], hidden, scratch);
+        try adapter_block.forwardSingleToken(allocator, store, spec, &cache.layers[layer_index], hidden, scratch);
         std.mem.swap([]f32, &hidden, &scratch);
     }
 

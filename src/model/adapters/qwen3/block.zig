@@ -1,11 +1,10 @@
 const std = @import("std");
-const cpu = @import("../kernel/cpu.zig");
-const attention = @import("../kernel/attention.zig");
-const tensor_store = @import("../tensor/store.zig");
-const kv_cache_mod = @import("kv_cache.zig");
-const qwen3_attention = @import("qwen3_attention.zig");
+const cpu = @import("../../../kernel/cpu.zig");
+const tensor_store = @import("../../../tensor/store.zig");
+const kv_cache_mod = @import("../../kv_cache.zig");
+const adapter_attention = @import("attention.zig");
 
-pub const Qwen3BlockSpec = struct {
+pub const BlockSpec = struct {
     layer_index: usize,
     hidden_size: usize,
     intermediate_size: usize,
@@ -15,7 +14,7 @@ pub const Qwen3BlockSpec = struct {
     rope_theta: f32,
     rms_norm_eps: f32,
 
-    pub fn validate(self: Qwen3BlockSpec) !void {
+    pub fn validate(self: BlockSpec) !void {
         if (self.hidden_size == 0) return error.InvalidHiddenSize;
         if (self.intermediate_size == 0) return error.InvalidIntermediateSize;
         if (self.num_attention_heads == 0) return error.InvalidAttentionHeads;
@@ -23,7 +22,7 @@ pub const Qwen3BlockSpec = struct {
         if (self.num_attention_heads % self.num_key_value_heads != 0) return error.InvalidGrouping;
     }
 
-    pub fn attentionSpec(self: Qwen3BlockSpec) qwen3_attention.Qwen3AttentionSpec {
+    pub fn attentionSpec(self: BlockSpec) adapter_attention.AttentionSpec {
         return .{
             .hidden_size = self.num_attention_heads * self.head_dim,
             .num_attention_heads = self.num_attention_heads,
@@ -37,7 +36,7 @@ pub const Qwen3BlockSpec = struct {
 pub fn forwardSingleToken(
     allocator: std.mem.Allocator,
     store: *const tensor_store.TensorStore,
-    spec: Qwen3BlockSpec,
+    spec: BlockSpec,
     cache: *kv_cache_mod.LayerKVCache,
     hidden_in: []const f32,
     hidden_out: []f32,
@@ -97,14 +96,14 @@ pub fn forwardSingleToken(
     );
 
     const position = cache.len;
-    try qwen3_attention.applyRoPEToProjectedHeadsInPlace(spec.attentionSpec(), q_normed, k_normed, position);
+    try adapter_attention.applyRoPEToProjectedHeadsInPlace(spec.attentionSpec(), q_normed, k_normed, position);
     try cache.append(k_normed, v_proj);
 
     const attn_flat = try allocator.alloc(f32, spec.num_attention_heads * spec.head_dim);
     defer allocator.free(attn_flat);
     const scores = try allocator.alloc(f32, cache.len);
     defer allocator.free(scores);
-    try qwen3_attention.forwardProjectedSingleToken(
+    try adapter_attention.forwardProjectedSingleToken(
         spec.attentionSpec(),
         attn_flat,
         q_normed,
@@ -152,7 +151,7 @@ pub fn forwardSingleToken(
 fn matmulWeight(
     allocator: std.mem.Allocator,
     store: *const tensor_store.TensorStore,
-    spec: Qwen3BlockSpec,
+    spec: BlockSpec,
     comptime suffix: []const u8,
     output: []f32,
     input: []const f32,
@@ -165,7 +164,7 @@ fn matmulWeight(
 fn loadVectorWeight(
     allocator: std.mem.Allocator,
     store: *const tensor_store.TensorStore,
-    spec: Qwen3BlockSpec,
+    spec: BlockSpec,
     comptime suffix: []const u8,
     expected_len: usize,
 ) ![]f32 {
@@ -185,7 +184,7 @@ fn tensorName(
     return std.fmt.allocPrint(allocator, "model.layers.{d}.{s}", .{ layer_index, suffix });
 }
 
-test "qwen3 block tensor naming matches expected layout" {
+test "adapter block tensor naming matches expected layout" {
     const testing = std.testing;
 
     const name = try tensorName(testing.allocator, 7, "self_attn.q_proj.weight");

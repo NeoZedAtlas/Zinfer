@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const Qwen3Config = struct {
+pub const Config = struct {
     architectures: []const []const u8 = &.{},
     head_dim: usize,
     hidden_size: usize,
@@ -16,7 +16,7 @@ pub const Qwen3Config = struct {
     torch_dtype: []const u8,
     vocab_size: usize,
 
-    pub fn firstArchitecture(self: Qwen3Config) ?[]const u8 {
+    pub fn firstArchitecture(self: Config) ?[]const u8 {
         if (self.architectures.len == 0) return null;
         return self.architectures[0];
     }
@@ -24,7 +24,7 @@ pub const Qwen3Config = struct {
 
 pub const ParsedConfig = struct {
     arena: std.heap.ArenaAllocator,
-    value: Qwen3Config,
+    value: Config,
 
     pub fn deinit(self: *ParsedConfig) void {
         self.arena.deinit();
@@ -37,7 +37,7 @@ pub fn loadFromFile(backing_allocator: std.mem.Allocator, path: []const u8) !Par
 
     const allocator = arena.allocator();
     const bytes = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
-    const config = try std.json.parseFromSliceLeaky(Qwen3Config, allocator, bytes, .{
+    const config = try std.json.parseFromSliceLeaky(Config, allocator, bytes, .{
         .ignore_unknown_fields = true,
     });
 

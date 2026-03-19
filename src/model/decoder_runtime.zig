@@ -1,7 +1,7 @@
 const std = @import("std");
 const decoder_family = @import("decoder_family.zig");
-const qwen3_config = @import("qwen3_config.zig");
-const qwen3_model = @import("qwen3_model.zig");
+const adapter_config = @import("adapters/qwen3/config.zig");
+const adapter_runtime = @import("adapters/qwen3/runtime.zig");
 const tensor_store = @import("../tensor/store.zig");
 
 pub const Architecture = decoder_family.Architecture;
@@ -22,7 +22,7 @@ pub const DecoderConfig = struct {
     torch_dtype: []const u8,
     tie_word_embeddings: bool,
 
-    pub fn fromQwen3(cfg: qwen3_config.Qwen3Config) DecoderConfig {
+    pub fn fromAdapterConfig(cfg: adapter_config.Config) DecoderConfig {
         return .{
             .architecture = .qwen3,
             .model_type = cfg.model_type,
@@ -41,7 +41,7 @@ pub const DecoderConfig = struct {
         };
     }
 
-    pub fn toQwen3(self: DecoderConfig) qwen3_config.Qwen3Config {
+    pub fn toAdapterConfig(self: DecoderConfig) adapter_config.Config {
         return .{
             .architectures = &.{},
             .head_dim = self.head_dim,
@@ -72,7 +72,7 @@ pub const ParsedConfig = struct {
 
 pub const ModelCache = struct {
     architecture: Architecture,
-    qwen3: qwen3_model.ModelCache,
+    qwen3: adapter_runtime.ModelCache,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -82,7 +82,7 @@ pub const ModelCache = struct {
         return switch (cfg.architecture) {
             .qwen3 => .{
                 .architecture = .qwen3,
-                .qwen3 = try qwen3_model.ModelCache.init(
+                .qwen3 = try adapter_runtime.ModelCache.init(
                     allocator,
                     cfg.num_hidden_layers,
                     max_seq_len,
@@ -100,10 +100,10 @@ pub const ModelCache = struct {
     }
 };
 
-pub const TopLogit = qwen3_model.TopLogit;
+pub const TopLogit = adapter_runtime.TopLogit;
 
 pub fn loadConfigFromFile(backing_allocator: std.mem.Allocator, path: []const u8) !ParsedConfig {
-    var qwen3 = try qwen3_config.loadFromFile(backing_allocator, path);
+    var qwen3 = try adapter_config.loadFromFile(backing_allocator, path);
     errdefer qwen3.deinit();
 
     const architecture = decoder_family.detectArchitecture(qwen3.value.model_type) orelse return error.UnsupportedModelType;
@@ -111,7 +111,7 @@ pub fn loadConfigFromFile(backing_allocator: std.mem.Allocator, path: []const u8
 
     return .{
         .arena = qwen3.arena,
-        .value = DecoderConfig.fromQwen3(qwen3.value),
+        .value = DecoderConfig.fromAdapterConfig(qwen3.value),
     };
 }
 
@@ -123,7 +123,7 @@ pub fn forwardTokenId(
     token_id: usize,
 ) ![]f32 {
     return switch (cfg.architecture) {
-        .qwen3 => qwen3_model.forwardTokenId(allocator, store, cfg.toQwen3(), &cache.qwen3, token_id),
+        .qwen3 => adapter_runtime.forwardTokenId(allocator, store, cfg.toAdapterConfig(), &cache.qwen3, token_id),
     };
 }
 
@@ -132,11 +132,11 @@ pub fn topKLogitsAlloc(
     logits: []const f32,
     k: usize,
 ) ![]TopLogit {
-    return qwen3_model.topKLogitsAlloc(allocator, logits, k);
+    return adapter_runtime.topKLogitsAlloc(allocator, logits, k);
 }
 
 pub fn argMaxLogit(logits: []const f32) !usize {
-    return qwen3_model.argMaxLogit(logits);
+    return adapter_runtime.argMaxLogit(logits);
 }
 
 test "decoder config loads qwen3 architecture" {

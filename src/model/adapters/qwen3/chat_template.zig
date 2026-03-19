@@ -1,5 +1,5 @@
 const std = @import("std");
-const qwen_bpe = @import("qwen_bpe.zig");
+const adapter_tokenizer = @import("tokenizer.zig");
 
 pub const ThinkingMode = enum {
     enabled,
@@ -149,7 +149,7 @@ fn stripHistoricalThinking(content: []const u8) []const u8 {
     return std.mem.trimLeft(u8, content[close_index + close_tag.len ..], "\n");
 }
 
-test "single user prompt matches qwen thinking template" {
+test "single user prompt matches adapter thinking template" {
     const testing = std.testing;
     const prompt = try renderSingleUserPromptAlloc(testing.allocator, "Hello", .enabled);
     defer testing.allocator.free(prompt);
@@ -159,7 +159,7 @@ test "single user prompt matches qwen thinking template" {
         prompt,
     );
 
-    var tokenizer = try qwen_bpe.Tokenizer.loadFromModelDir(testing.allocator, "models/Qwen3-0.6B");
+    var tokenizer = try adapter_tokenizer.Tokenizer.loadFromModelDir(testing.allocator, "models/Qwen3-0.6B");
     defer tokenizer.deinit();
 
     const ids = try tokenizer.encodeAlloc(testing.allocator, prompt);
@@ -167,7 +167,7 @@ test "single user prompt matches qwen thinking template" {
     try testing.expectEqualSlices(u32, &[_]u32{ 151644, 872, 198, 9707, 151645, 198, 151644, 77091, 198 }, ids);
 }
 
-test "single user prompt matches qwen non-thinking template" {
+test "single user prompt matches adapter non-thinking template" {
     const testing = std.testing;
     const prompt = try renderSingleUserPromptAlloc(testing.allocator, "Hello", .disabled);
     defer testing.allocator.free(prompt);
@@ -177,7 +177,7 @@ test "single user prompt matches qwen non-thinking template" {
         prompt,
     );
 
-    var tokenizer = try qwen_bpe.Tokenizer.loadFromModelDir(testing.allocator, "models/Qwen3-0.6B");
+    var tokenizer = try adapter_tokenizer.Tokenizer.loadFromModelDir(testing.allocator, "models/Qwen3-0.6B");
     defer tokenizer.deinit();
 
     const ids = try tokenizer.encodeAlloc(testing.allocator, prompt);
@@ -185,7 +185,7 @@ test "single user prompt matches qwen non-thinking template" {
     try testing.expectEqualSlices(u32, &[_]u32{ 151644, 872, 198, 9707, 151645, 198, 151644, 77091, 198, 151667, 271, 151668, 271 }, ids);
 }
 
-test "multi-message prompt matches qwen template and strips historical thinking" {
+test "multi-message prompt matches adapter template and strips historical thinking" {
     const testing = std.testing;
     const messages = [_]Message{
         .{ .role = .system, .content = "You are terse." },

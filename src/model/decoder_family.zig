@@ -1,6 +1,6 @@
 const std = @import("std");
-const qwen_bpe = @import("../tokenizer/qwen_bpe.zig");
-const qwen_chat_template = @import("../tokenizer/qwen_chat_template.zig");
+const adapter_tokenizer = @import("adapters/qwen3/tokenizer.zig");
+const adapter_chat_template = @import("adapters/qwen3/chat_template.zig");
 
 pub const Architecture = enum {
     qwen3,
@@ -10,13 +10,13 @@ pub const Architecture = enum {
     }
 };
 
-pub const ThinkingMode = qwen_chat_template.ThinkingMode;
-pub const Role = qwen_chat_template.Role;
-pub const ToolCall = qwen_chat_template.ToolCall;
-pub const Message = qwen_chat_template.Message;
+pub const ThinkingMode = adapter_chat_template.ThinkingMode;
+pub const Role = adapter_chat_template.Role;
+pub const ToolCall = adapter_chat_template.ToolCall;
+pub const Message = adapter_chat_template.Message;
 
 pub const Tokenizer = union(Architecture) {
-    qwen3: qwen_bpe.Tokenizer,
+    qwen3: adapter_tokenizer.Tokenizer,
 
     pub fn loadFromModelDir(
         backing_allocator: std.mem.Allocator,
@@ -100,9 +100,9 @@ fn entryForArchitecture(architecture: Architecture) Entry {
         .qwen3 => .{
             .model_type = "qwen3",
             .load_tokenizer = loadQwen3TokenizerFromModelDir,
-            .render_messages_prompt_alloc = qwen_chat_template.renderMessagesPromptAlloc,
-            .render_single_user_prompt_alloc = qwen_chat_template.renderSingleUserPromptAlloc,
-            .assistant_history_content = qwen_chat_template.assistantHistoryContent,
+            .render_messages_prompt_alloc = adapter_chat_template.renderMessagesPromptAlloc,
+            .render_single_user_prompt_alloc = adapter_chat_template.renderSingleUserPromptAlloc,
+            .assistant_history_content = adapter_chat_template.assistantHistoryContent,
         },
     };
 }
@@ -112,7 +112,7 @@ fn loadQwen3TokenizerFromModelDir(
     model_dir: []const u8,
 ) !Tokenizer {
     return .{
-        .qwen3 = try qwen_bpe.Tokenizer.loadFromModelDir(backing_allocator, model_dir),
+        .qwen3 = try adapter_tokenizer.Tokenizer.loadFromModelDir(backing_allocator, model_dir),
     };
 }
 

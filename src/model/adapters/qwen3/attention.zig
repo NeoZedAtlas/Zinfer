@@ -1,14 +1,14 @@
 const std = @import("std");
-const attention = @import("../kernel/attention.zig");
+const attention = @import("../../../kernel/attention.zig");
 
-pub const Qwen3AttentionSpec = struct {
+pub const AttentionSpec = struct {
     hidden_size: usize,
     num_attention_heads: usize,
     num_key_value_heads: usize,
     head_dim: usize,
     rope_theta: f32,
 
-    pub fn validate(self: Qwen3AttentionSpec) !void {
+    pub fn validate(self: AttentionSpec) !void {
         if (self.hidden_size == 0) return error.InvalidHiddenSize;
         if (self.num_attention_heads == 0) return error.InvalidAttentionHeads;
         if (self.num_key_value_heads == 0) return error.InvalidKeyValueHeads;
@@ -21,17 +21,17 @@ pub const Qwen3AttentionSpec = struct {
         }
     }
 
-    pub fn queryGroupSize(self: Qwen3AttentionSpec) usize {
+    pub fn queryGroupSize(self: AttentionSpec) usize {
         return self.num_attention_heads / self.num_key_value_heads;
     }
 
-    pub fn kvHeadForQueryHead(self: Qwen3AttentionSpec, q_head_idx: usize) usize {
+    pub fn kvHeadForQueryHead(self: AttentionSpec, q_head_idx: usize) usize {
         return q_head_idx / self.queryGroupSize();
     }
 };
 
 pub fn applyRoPEToProjectedHeadsInPlace(
-    spec: Qwen3AttentionSpec,
+    spec: AttentionSpec,
     projected_query: []f32,
     projected_key: []f32,
     position: usize,
@@ -57,7 +57,7 @@ pub fn applyRoPEToProjectedHeadsInPlace(
 }
 
 pub fn forwardProjectedSingleToken(
-    spec: Qwen3AttentionSpec,
+    spec: AttentionSpec,
     output: []f32,
     projected_query: []const f32,
     key_cache: []const f32,
@@ -79,10 +79,10 @@ pub fn forwardProjectedSingleToken(
     );
 }
 
-test "qwen3 attention spec validates grouping and dimensions" {
+test "adapter attention spec validates grouping and dimensions" {
     const testing = std.testing;
 
-    const spec = Qwen3AttentionSpec{
+    const spec = AttentionSpec{
         .hidden_size = 8,
         .num_attention_heads = 4,
         .num_key_value_heads = 2,
