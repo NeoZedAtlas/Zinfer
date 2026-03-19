@@ -1,9 +1,12 @@
 const std = @import("std");
 const tensor_store = @import("../tensor/store.zig");
+const weights_layout = @import("weights_layout.zig");
 const adapter_config = @import("adapters/qwen3/config.zig");
 const adapter_runtime = @import("adapters/qwen3/runtime.zig");
+const adapter_spec = @import("adapters/qwen3/spec.zig");
 const adapter_tokenizer = @import("adapters/qwen3/tokenizer.zig");
 const adapter_chat_template = @import("adapters/qwen3/chat_template.zig");
+const adapter_weights = @import("adapters/qwen3/weights.zig");
 
 pub const Architecture = enum {
     qwen3,
@@ -18,6 +21,8 @@ pub const Role = adapter_chat_template.Role;
 pub const ToolCall = adapter_chat_template.ToolCall;
 pub const Message = adapter_chat_template.Message;
 pub const TopLogit = adapter_runtime.TopLogit;
+pub const CommonWeights = weights_layout.CommonWeights;
+pub const LayerTensorKind = weights_layout.LayerTensorKind;
 
 pub const DecoderConfig = struct {
     architecture: Architecture,
@@ -101,6 +106,8 @@ const Entry = struct {
     forward_token_id: *const fn (std.mem.Allocator, *const tensor_store.TensorStore, DecoderConfig, *ModelCache, usize) anyerror![]f32,
     top_k_logits_alloc: *const fn (std.mem.Allocator, []const f32, usize) anyerror![]TopLogit,
     arg_max_logit: *const fn ([]const f32) anyerror!usize,
+    common_weights: CommonWeights,
+    layer_tensor_name_alloc: *const fn (std.mem.Allocator, usize, LayerTensorKind) anyerror![]u8,
     load_tokenizer: *const fn (std.mem.Allocator, []const u8) anyerror!Tokenizer,
     render_messages_prompt_alloc: *const fn (std.mem.Allocator, []const Message, ThinkingMode) anyerror![]u8,
     render_single_user_prompt_alloc: *const fn (std.mem.Allocator, []const u8, ThinkingMode) anyerror![]u8,
@@ -153,6 +160,19 @@ pub fn argMaxLogit(
     return try entryForArchitecture(architecture).arg_max_logit(logits);
 }
 
+pub fn commonWeights(architecture: Architecture) CommonWeights {
+    return entryForArchitecture(architecture).common_weights;
+}
+
+pub fn layerTensorNameAlloc(
+    allocator: std.mem.Allocator,
+    architecture: Architecture,
+    layer_index: usize,
+    kind: LayerTensorKind,
+) ![]u8 {
+    return try entryForArchitecture(architecture).layer_tensor_name_alloc(allocator, layer_index, kind);
+}
+
 pub fn renderMessagesPromptAlloc(
     allocator: std.mem.Allocator,
     architecture: Architecture,
@@ -187,6 +207,8 @@ fn entryForArchitecture(architecture: Architecture) Entry {
             .forward_token_id = forwardQwen3TokenId,
             .top_k_logits_alloc = adapter_runtime.topKLogitsAlloc,
             .arg_max_logit = adapter_runtime.argMaxLogit,
+            .common_weights = adapter_weights.common_weights,
+            .layer_tensor_name_alloc = adapter_weights.layerTensorNameAlloc,
             .load_tokenizer = loadQwen3TokenizerFromModelDir,
             .render_messages_prompt_alloc = adapter_chat_template.renderMessagesPromptAlloc,
             .render_single_user_prompt_alloc = adapter_chat_template.renderSingleUserPromptAlloc,
@@ -340,4 +362,17 @@ test "family tokenizer loads qwen3 and roundtrips prompt text" {
     const text = try tokenizer.decodeAlloc(testing.allocator, ids);
     defer testing.allocator.free(text);
     try testing.expectEqualStrings("<|im_start|>user\nHello<|im_end|>\n", text);
+}
+
+test "family exposes qwen3 weight naming policy" {
+    const testing = std.testing;
+
+    const common = commonWeights(.qwen3);
+    try testing.expectEqualStrings("model.embed_tokens.weight", common.embed_tokens_weight);
+    try testing.expectEqualStrings("model.norm.weight", common.final_norm_weight);
+    try testing.expectEqualStrings("lm_head.weight", common.lm_head_weight);
+
+    const layer_name = try layerTensorNameAlloc(testing.allocator, .qwen3, 2, .mlp_down_proj_weight);
+    defer testing.allocator.free(layer_name);
+    try testing.expectEqualStrings("model.layers.2.mlp.down_proj.weight", layer_name);
 }

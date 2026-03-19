@@ -2,6 +2,7 @@ const std = @import("std");
 const safetensors = @import("format/safetensors.zig");
 const kv_cache = @import("model/kv_cache.zig");
 const adapter_block = @import("model/adapters/qwen3/block.zig");
+const adapter_spec = @import("model/adapters/qwen3/spec.zig");
 const decoder_family = @import("model/decoder_family.zig");
 const decoder_runtime = @import("model/decoder_runtime.zig");
 const tensor_store = @import("tensor/store.zig");
@@ -805,16 +806,16 @@ fn probeBlock(
     const hidden_out = try allocator.alloc(f32, cfg.hidden_size);
     defer allocator.free(hidden_out);
 
-    const spec = adapter_block.BlockSpec{
-        .layer_index = layer_index,
-        .hidden_size = cfg.hidden_size,
-        .intermediate_size = cfg.intermediate_size,
-        .num_attention_heads = cfg.num_attention_heads,
-        .num_key_value_heads = cfg.num_key_value_heads,
-        .head_dim = cfg.head_dim,
-        .rope_theta = @floatCast(cfg.rope_theta),
-        .rms_norm_eps = @floatCast(cfg.rms_norm_eps),
-    };
+    const spec = adapter_spec.blockSpecFromFields(
+        layer_index,
+        cfg.hidden_size,
+        cfg.intermediate_size,
+        cfg.num_attention_heads,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        cfg.rope_theta,
+        cfg.rms_norm_eps,
+    );
     try adapter_block.forwardSingleToken(allocator, &store, spec, &cache, hidden_in, hidden_out);
 
     const stdout = std.fs.File.stdout().deprecatedWriter();

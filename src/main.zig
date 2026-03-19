@@ -17,8 +17,11 @@ test {
     _ = @import("model/adapters/qwen3/block.zig");
     _ = @import("model/adapters/qwen3/runtime.zig");
     _ = @import("model/adapters/qwen3/attention.zig");
+    _ = @import("model/adapters/qwen3/spec.zig");
+    _ = @import("model/adapters/qwen3/weights.zig");
     _ = @import("model/decoder_family.zig");
     _ = @import("model/decoder_runtime.zig");
+    _ = @import("model/weights_layout.zig");
     _ = @import("model/adapters/qwen3/tokenizer.zig");
     _ = @import("model/adapters/qwen3/chat_template.zig");
     _ = @import("sampling/sampler.zig");

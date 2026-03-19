@@ -3,6 +3,7 @@ const cpu = @import("../../../kernel/cpu.zig");
 const tensor_store = @import("../../../tensor/store.zig");
 const kv_cache_mod = @import("../../kv_cache.zig");
 const adapter_attention = @import("attention.zig");
+const adapter_weights = @import("weights.zig");
 
 pub const BlockSpec = struct {
     layer_index: usize,
@@ -47,13 +48,13 @@ pub fn forwardSingleToken(
         return error.CacheSpecMismatch;
     }
 
-    const input_ln_weight = try loadVectorWeight(allocator, store, spec, "input_layernorm.weight", spec.hidden_size);
+    const input_ln_weight = try loadVectorWeight(allocator, store, spec, .input_layernorm_weight, spec.hidden_size);
     defer allocator.free(input_ln_weight);
-    const q_norm_weight = try loadVectorWeight(allocator, store, spec, "self_attn.q_norm.weight", spec.head_dim);
+    const q_norm_weight = try loadVectorWeight(allocator, store, spec, .self_attn_q_norm_weight, spec.head_dim);
     defer allocator.free(q_norm_weight);
-    const k_norm_weight = try loadVectorWeight(allocator, store, spec, "self_attn.k_norm.weight", spec.head_dim);
+    const k_norm_weight = try loadVectorWeight(allocator, store, spec, .self_attn_k_norm_weight, spec.head_dim);
     defer allocator.free(k_norm_weight);
-    const post_ln_weight = try loadVectorWeight(allocator, store, spec, "post_attention_layernorm.weight", spec.hidden_size);
+    const post_ln_weight = try loadVectorWeight(allocator, store, spec, .post_attention_layernorm_weight, spec.hidden_size);
     defer allocator.free(post_ln_weight);
 
     const normed = try allocator.alloc(f32, spec.hidden_size);
@@ -62,16 +63,16 @@ pub fn forwardSingleToken(
 
     const q_proj = try allocator.alloc(f32, spec.num_attention_heads * spec.head_dim);
     defer allocator.free(q_proj);
-    try matmulWeight(allocator, store, spec, "self_attn.q_proj.weight", q_proj, normed);
+    try matmulWeight(allocator, store, spec, .self_attn_q_proj_weight, q_proj, normed);
 
     const kv_width = spec.num_key_value_heads * spec.head_dim;
     const k_proj = try allocator.alloc(f32, kv_width);
     defer allocator.free(k_proj);
-    try matmulWeight(allocator, store, spec, "self_attn.k_proj.weight", k_proj, normed);
+    try matmulWeight(allocator, store, spec, .self_attn_k_proj_weight, k_proj, normed);
 
     const v_proj = try allocator.alloc(f32, kv_width);
     defer allocator.free(v_proj);
-    try matmulWeight(allocator, store, spec, "self_attn.v_proj.weight", v_proj, normed);
+    try matmulWeight(allocator, store, spec, .self_attn_v_proj_weight, v_proj, normed);
 
     const q_normed = try allocator.alloc(f32, q_proj.len);
     defer allocator.free(q_normed);
@@ -115,7 +116,7 @@ pub fn forwardSingleToken(
 
     const attn_out = try allocator.alloc(f32, spec.hidden_size);
     defer allocator.free(attn_out);
-    try matmulWeight(allocator, store, spec, "self_attn.o_proj.weight", attn_out, attn_flat);
+    try matmulWeight(allocator, store, spec, .self_attn_o_proj_weight, attn_out, attn_flat);
 
     const post_attn = try allocator.alloc(f32, spec.hidden_size);
     defer allocator.free(post_attn);
@@ -129,11 +130,11 @@ pub fn forwardSingleToken(
 
     const gate = try allocator.alloc(f32, spec.intermediate_size);
     defer allocator.free(gate);
-    try matmulWeight(allocator, store, spec, "mlp.gate_proj.weight", gate, post_normed);
+    try matmulWeight(allocator, store, spec, .mlp_gate_proj_weight, gate, post_normed);
 
     const up = try allocator.alloc(f32, spec.intermediate_size);
     defer allocator.free(up);
-    try matmulWeight(allocator, store, spec, "mlp.up_proj.weight", up, post_normed);
+    try matmulWeight(allocator, store, spec, .mlp_up_proj_weight, up, post_normed);
 
     const activated = try allocator.alloc(f32, spec.intermediate_size);
     defer allocator.free(activated);
@@ -141,7 +142,7 @@ pub fn forwardSingleToken(
 
     const mlp_out = try allocator.alloc(f32, spec.hidden_size);
     defer allocator.free(mlp_out);
-    try matmulWeight(allocator, store, spec, "mlp.down_proj.weight", mlp_out, activated);
+    try matmulWeight(allocator, store, spec, .mlp_down_proj_weight, mlp_out, activated);
 
     for (hidden_out, post_attn, mlp_out) |*out, residual, mlp_value| {
         out.* = residual + mlp_value;
@@ -152,11 +153,11 @@ fn matmulWeight(
     allocator: std.mem.Allocator,
     store: *const tensor_store.TensorStore,
     spec: BlockSpec,
-    comptime suffix: []const u8,
+    kind: @import("../../weights_layout.zig").LayerTensorKind,
     output: []f32,
     input: []const f32,
 ) !void {
-    const name = try tensorName(allocator, spec.layer_index, suffix);
+    const name = try adapter_weights.layerTensorNameAlloc(allocator, spec.layer_index, kind);
     defer allocator.free(name);
     try store.matmulVecByName(output, name, input);
 }
@@ -165,30 +166,13 @@ fn loadVectorWeight(
     allocator: std.mem.Allocator,
     store: *const tensor_store.TensorStore,
     spec: BlockSpec,
-    comptime suffix: []const u8,
+    kind: @import("../../weights_layout.zig").LayerTensorKind,
     expected_len: usize,
 ) ![]f32 {
-    const name = try tensorName(allocator, spec.layer_index, suffix);
+    const name = try adapter_weights.layerTensorNameAlloc(allocator, spec.layer_index, kind);
     defer allocator.free(name);
     const values = try store.readElementsAsF32Alloc(name, 0, expected_len);
     errdefer allocator.free(values);
     if (values.len != expected_len) return error.SizeMismatch;
     return values;
-}
-
-fn tensorName(
-    allocator: std.mem.Allocator,
-    layer_index: usize,
-    comptime suffix: []const u8,
-) ![]u8 {
-    return std.fmt.allocPrint(allocator, "model.layers.{d}.{s}", .{ layer_index, suffix });
-}
-
-test "adapter block tensor naming matches expected layout" {
-    const testing = std.testing;
-
-    const name = try tensorName(testing.allocator, 7, "self_attn.q_proj.weight");
-    defer testing.allocator.free(name);
-
-    try testing.expectEqualStrings("model.layers.7.self_attn.q_proj.weight", name);
 }

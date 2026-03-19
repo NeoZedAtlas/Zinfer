@@ -3,6 +3,8 @@ const cpu = @import("../../../kernel/cpu.zig");
 const kv_cache = @import("../../kv_cache.zig");
 const adapter_block = @import("block.zig");
 const adapter_config = @import("config.zig");
+const adapter_spec = @import("spec.zig");
+const adapter_weights = @import("weights.zig");
 const tensor_store = @import("../../../tensor/store.zig");
 
 pub const ModelCache = struct {
@@ -53,28 +55,19 @@ pub fn forwardTokenId(
     if (token_id >= cfg.vocab_size) return error.TokenIdOutOfBounds;
     if (cache.layers.len != cfg.num_hidden_layers) return error.CacheLayerMismatch;
 
-    var hidden = try store.readRowAsF32Alloc("model.embed_tokens.weight", token_id);
+    var hidden = try store.readRowAsF32Alloc(adapter_weights.common_weights.embed_tokens_weight, token_id);
     defer allocator.free(hidden);
 
     var scratch = try allocator.alloc(f32, cfg.hidden_size);
     defer allocator.free(scratch);
 
     for (0..cfg.num_hidden_layers) |layer_index| {
-        const spec = adapter_block.BlockSpec{
-            .layer_index = layer_index,
-            .hidden_size = cfg.hidden_size,
-            .intermediate_size = cfg.intermediate_size,
-            .num_attention_heads = cfg.num_attention_heads,
-            .num_key_value_heads = cfg.num_key_value_heads,
-            .head_dim = cfg.head_dim,
-            .rope_theta = @floatCast(cfg.rope_theta),
-            .rms_norm_eps = @floatCast(cfg.rms_norm_eps),
-        };
+        const spec = adapter_spec.blockSpecFromConfig(cfg, layer_index);
         try adapter_block.forwardSingleToken(allocator, store, spec, &cache.layers[layer_index], hidden, scratch);
         std.mem.swap([]f32, &hidden, &scratch);
     }
 
-    const final_norm_weight = try store.readElementsAsF32Alloc("model.norm.weight", 0, cfg.hidden_size);
+    const final_norm_weight = try store.readElementsAsF32Alloc(adapter_weights.common_weights.final_norm_weight, 0, cfg.hidden_size);
     defer allocator.free(final_norm_weight);
 
     const final_hidden = try allocator.alloc(f32, cfg.hidden_size);
@@ -83,7 +76,7 @@ pub fn forwardTokenId(
 
     const logits = try allocator.alloc(f32, cfg.vocab_size);
     errdefer allocator.free(logits);
-    try store.matmulVecByName(logits, "lm_head.weight", final_hidden);
+    try store.matmulVecByName(logits, adapter_weights.common_weights.lm_head_weight, final_hidden);
     return logits;
 }
 
