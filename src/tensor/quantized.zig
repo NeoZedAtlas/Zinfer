@@ -1,5 +1,6 @@
 const std = @import("std");
 const safetensors = @import("../format/safetensors.zig");
+const parallel_rows = @import("parallel_rows.zig");
 const tensor_store = @import("store.zig");
 
 pub const Scheme = enum {
@@ -155,6 +156,7 @@ pub const Store = struct {
         name: []const u8,
         input: []const f32,
         thread_count: usize,
+        pool: ?*parallel_rows.Pool,
     ) !void {
         const tensor = self.getTensor(name) orelse return error.TensorNotFound;
         if (tensor.rank() != 2) return error.InvalidTensorRank;
@@ -163,11 +165,17 @@ pub const Store = struct {
         const cols = std.math.cast(usize, tensor.shape[1]) orelse return error.DimensionTooLarge;
         if (output.len != rows or input.len != cols) return error.SizeMismatch;
 
-        if (thread_count > 1 and rows >= 8192) {
+        if (shouldParallelize(rows, cols, thread_count, pool != null)) {
+            if (pool) |available_pool| {
+                self.matmulWithPool(output, tensor, input, available_pool);
+                return;
+            }
+        }
+        if (shouldParallelize(rows, cols, thread_count, true)) {
             try self.matmulThreaded(output, tensor, input, thread_count);
             return;
         }
-        try self.matmulRange(output, tensor, input, 0, rows);
+        self.matmulRange(output, tensor, input, 0, rows);
     }
 
     fn matmulThreaded(
@@ -179,7 +187,7 @@ pub const Store = struct {
     ) !void {
         const actual_threads = @min(thread_count, output.len);
         if (actual_threads <= 1) {
-            try self.matmulRange(output, tensor, input, 0, output.len);
+            self.matmulRange(output, tensor, input, 0, output.len);
             return;
         }
 
@@ -194,7 +202,7 @@ pub const Store = struct {
             end_row: usize,
 
             fn run(ctx: *@This()) void {
-                ctx.store.matmulRange(ctx.output, ctx.tensor, ctx.input, ctx.start_row, ctx.end_row) catch unreachable;
+                ctx.store.matmulRange(ctx.output, ctx.tensor, ctx.input, ctx.start_row, ctx.end_row);
             }
         };
 
@@ -219,7 +227,7 @@ pub const Store = struct {
             start_row = end_row;
         }
 
-        try self.matmulRange(output, tensor, input, start_row, output.len);
+        self.matmulRange(output, tensor, input, start_row, output.len);
         for (threads) |thread| thread.join();
     }
 
@@ -230,7 +238,7 @@ pub const Store = struct {
         input: []const f32,
         start_row: usize,
         end_row: usize,
-    ) !void {
+    ) void {
         for (start_row..end_row) |row_idx| {
             const row_offset = tensor.absolute_offset + @as(u64, row_idx) * tensor.row_bytes;
             output[row_idx] = switch (tensor.encoding) {
@@ -240,7 +248,41 @@ pub const Store = struct {
             };
         }
     }
+
+    fn matmulWithPool(
+        self: *const Store,
+        output: []f32,
+        tensor: TensorInfo,
+        input: []const f32,
+        pool: *parallel_rows.Pool,
+    ) void {
+        const Context = struct {
+            store: *const Store,
+            output: []f32,
+            tensor: TensorInfo,
+            input: []const f32,
+
+            fn runRange(ctx_ptr: *anyopaque, start_row: usize, end_row: usize) void {
+                const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                ctx.store.matmulRange(ctx.output, ctx.tensor, ctx.input, start_row, end_row);
+            }
+        };
+
+        var context = Context{
+            .store = self,
+            .output = output,
+            .tensor = tensor,
+            .input = input,
+        };
+        pool.run(output.len, &context, Context.runRange);
+    }
 };
+
+fn shouldParallelize(rows: usize, cols: usize, thread_count: usize, has_parallel_backend: bool) bool {
+    if (!has_parallel_backend or thread_count <= 1) return false;
+    const work = std.math.mul(u64, rows, cols) catch return true;
+    return work >= 1_000_000;
+}
 
 const QuantizedEntry = struct {
     name: []const u8,

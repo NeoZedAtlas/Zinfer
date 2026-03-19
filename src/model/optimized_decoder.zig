@@ -5,6 +5,7 @@ const generic_block = @import("rmsnorm_gqa_swiglu_block.zig");
 const gqa_attention = @import("gqa_attention.zig");
 const kv_cache = @import("kv_cache.zig");
 const tensor_backend = @import("../tensor/backend.zig");
+const parallel_rows = @import("../tensor/parallel_rows.zig");
 const weights_layout = @import("weights_layout.zig");
 
 pub const Runtime = struct {
@@ -16,6 +17,7 @@ pub const Runtime = struct {
     layers: []LayerWeights,
     final_norm_weight: []f32,
     thread_count: usize,
+    parallel_pool: parallel_rows.Pool,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -30,8 +32,13 @@ pub const Runtime = struct {
         errdefer parsed_config.deinit();
         const cfg = parsed_config.value;
 
+        const resolved_thread_count = thread_count orelse @max(1, std.Thread.getCpuCount() catch 1);
+
         var backend = try tensor_backend.Backend.openFromModelDir(allocator, model_dir, scheme);
         errdefer backend.deinit();
+
+        var parallel_pool = try parallel_rows.Pool.init(allocator, resolved_thread_count);
+        errdefer parallel_pool.deinit();
 
         const common_weights = decoder_family.commonWeights(cfg.architecture);
         const layer_layout = decoder_family.layerLayout(cfg.architecture);
@@ -61,7 +68,8 @@ pub const Runtime = struct {
             .layer_layout = layer_layout,
             .layers = layers,
             .final_norm_weight = final_norm_weight,
-            .thread_count = thread_count orelse @max(1, std.Thread.getCpuCount() catch 1),
+            .thread_count = resolved_thread_count,
+            .parallel_pool = parallel_pool,
         };
 
         parsed_config.deinit();
@@ -72,6 +80,7 @@ pub const Runtime = struct {
         for (self.layers) |*layer| layer.deinit(self.allocator);
         self.allocator.free(self.layers);
         self.allocator.free(self.final_norm_weight);
+        self.parallel_pool.deinit();
         self.backend.deinit();
     }
 
@@ -118,6 +127,7 @@ pub const Runtime = struct {
             self.common_weights.lm_head_weight,
             workspace.final_hidden,
             self.thread_count,
+            &self.parallel_pool,
             workspace.io_scratch,
         );
         return workspace.logits;
@@ -246,9 +256,9 @@ const LayerWeights = struct {
     ) !void {
         try cpu.rmsNorm(workspace.normed, hidden_in, self.input_ln_weight, self.spec.rms_norm_eps);
 
-        try runtime.backend.matmulVecByName(workspace.q_proj, self.q_proj_name, workspace.normed, runtime.thread_count, workspace.io_scratch);
-        try runtime.backend.matmulVecByName(workspace.k_proj, self.k_proj_name, workspace.normed, runtime.thread_count, workspace.io_scratch);
-        try runtime.backend.matmulVecByName(workspace.v_proj, self.v_proj_name, workspace.normed, runtime.thread_count, workspace.io_scratch);
+        try runtime.backend.matmulVecByName(workspace.q_proj, self.q_proj_name, workspace.normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
+        try runtime.backend.matmulVecByName(workspace.k_proj, self.k_proj_name, workspace.normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
+        try runtime.backend.matmulVecByName(workspace.v_proj, self.v_proj_name, workspace.normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
 
         if (self.q_norm_weight) |weight| {
             try cpu.rmsNormRepeated(workspace.q_normed, workspace.q_proj, self.spec.num_attention_heads, self.spec.head_dim, weight, self.spec.rms_norm_eps);
@@ -276,16 +286,16 @@ const LayerWeights = struct {
             workspace.scores[0..cache.len],
         );
 
-        try runtime.backend.matmulVecByName(workspace.attn_out, self.o_proj_name, workspace.attn_flat, runtime.thread_count, workspace.io_scratch);
+        try runtime.backend.matmulVecByName(workspace.attn_out, self.o_proj_name, workspace.attn_flat, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
         for (workspace.post_attn, hidden_in, workspace.attn_out) |*out, residual, attn_value| {
             out.* = residual + attn_value;
         }
 
         try cpu.rmsNorm(workspace.post_normed, workspace.post_attn, self.post_ln_weight, self.spec.rms_norm_eps);
-        try runtime.backend.matmulVecByName(workspace.gate, self.gate_proj_name, workspace.post_normed, runtime.thread_count, workspace.io_scratch);
-        try runtime.backend.matmulVecByName(workspace.up, self.up_proj_name, workspace.post_normed, runtime.thread_count, workspace.io_scratch);
+        try runtime.backend.matmulVecByName(workspace.gate, self.gate_proj_name, workspace.post_normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
+        try runtime.backend.matmulVecByName(workspace.up, self.up_proj_name, workspace.post_normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
         try cpu.swiglu(workspace.activated, workspace.gate, workspace.up);
-        try runtime.backend.matmulVecByName(workspace.mlp_out, self.down_proj_name, workspace.activated, runtime.thread_count, workspace.io_scratch);
+        try runtime.backend.matmulVecByName(workspace.mlp_out, self.down_proj_name, workspace.activated, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
 
         for (hidden_out, workspace.post_attn, workspace.mlp_out) |*out, residual, mlp_value| {
             out.* = residual + mlp_value;

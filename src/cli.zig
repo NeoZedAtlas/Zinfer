@@ -3,6 +3,7 @@ const safetensors = @import("format/safetensors.zig");
 const kv_cache = @import("model/kv_cache.zig");
 const decoder_family = @import("model/decoder_family.zig");
 const optimized_decoder = @import("model/optimized_decoder.zig");
+const tensor_backend = @import("tensor/backend.zig");
 const quantized = @import("tensor/quantized.zig");
 const tensor_store = @import("tensor/store.zig");
 const sampler = @import("sampling/sampler.zig");
@@ -17,6 +18,8 @@ const GenerateOptions = struct {
     seed: u64,
     stream_output: bool,
     stop_sequences: [][]const u8,
+    backend_scheme: tensor_backend.Scheme,
+    thread_count: usize,
 
     fn deinit(self: *GenerateOptions, allocator: std.mem.Allocator) void {
         allocator.free(self.stop_sequences);
@@ -370,6 +373,8 @@ fn printUsage() !void {
         \\  --frequency-penalty <f32>
         \\  --repetition-penalty <f32>
         \\  --stop <text>           (repeatable)
+        \\  --backend <auto|bf16|q8|q4>
+        \\  --threads <usize>       (0 = auto)
         \\  --stream
         \\  --load <path>           (chat only)
         \\  --save <path>           (chat only)
@@ -523,6 +528,8 @@ fn initGenerateOptions(mode: decoder_family.ThinkingMode, max_new_tokens: usize)
         .seed = 0,
         .stream_output = false,
         .stop_sequences = &.{},
+        .backend_scheme = .auto,
+        .thread_count = 0,
     };
 }
 
@@ -626,6 +633,18 @@ fn parseGenerateFlags(
             try stop_sequences.append(allocator, args[i]);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--backend")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            options.backend_scheme = try parseBackendScheme(args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--threads")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            options.thread_count = try std.fmt.parseInt(usize, args[i], 10);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--stream")) {
             options.stream_output = true;
             continue;
@@ -635,6 +654,14 @@ fn parseGenerateFlags(
     }
 
     options.stop_sequences = try stop_sequences.toOwnedSlice(allocator);
+}
+
+fn parseBackendScheme(text: []const u8) !tensor_backend.Scheme {
+    if (std.mem.eql(u8, text, "auto")) return .auto;
+    if (std.mem.eql(u8, text, "bf16")) return .bf16;
+    if (std.mem.eql(u8, text, "q8")) return .q8;
+    if (std.mem.eql(u8, text, "q4")) return .q4;
+    return error.InvalidBackendScheme;
 }
 
 fn parseChatFlags(
@@ -971,7 +998,7 @@ fn benchPrompt(
     user_text: []const u8,
     max_new_tokens: usize,
 ) !void {
-    var runtime = try GeneratorRuntime.init(allocator, model_dir);
+    var runtime = try GeneratorRuntime.init(allocator, model_dir, .auto, 0);
     defer runtime.deinit();
     const cfg = runtime.model.cfg;
 
@@ -1309,7 +1336,7 @@ fn generateText(
     user_text: []const u8,
     options: GenerateOptions,
 ) !void {
-    var runtime = try GeneratorRuntime.init(allocator, model_dir);
+    var runtime = try GeneratorRuntime.init(allocator, model_dir, options.backend_scheme, options.thread_count);
     defer runtime.deinit();
     const stdout = std.fs.File.stdout().deprecatedWriter();
 
@@ -1341,7 +1368,7 @@ fn generateChatFromFile(
     messages_json_path: []const u8,
     options: GenerateOptions,
 ) !void {
-    var runtime = try GeneratorRuntime.init(allocator, model_dir);
+    var runtime = try GeneratorRuntime.init(allocator, model_dir, options.backend_scheme, options.thread_count);
     defer runtime.deinit();
     const stdout = std.fs.File.stdout().deprecatedWriter();
 
@@ -1480,7 +1507,12 @@ const GeneratorRuntime = struct {
     tokenizer: decoder_family.Tokenizer,
     model: optimized_decoder.Runtime,
 
-    fn init(allocator: std.mem.Allocator, model_dir: []const u8) !GeneratorRuntime {
+    fn init(
+        allocator: std.mem.Allocator,
+        model_dir: []const u8,
+        backend_scheme: tensor_backend.Scheme,
+        thread_count: usize,
+    ) !GeneratorRuntime {
         const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
         defer allocator.free(config_path);
         var parsed_config = try decoder_family.loadConfigFromFile(allocator, config_path);
@@ -1493,7 +1525,12 @@ const GeneratorRuntime = struct {
         );
         errdefer tokenizer.deinit();
 
-        var model = try optimized_decoder.Runtime.init(allocator, model_dir, .auto, null);
+        var model = try optimized_decoder.Runtime.init(
+            allocator,
+            model_dir,
+            backend_scheme,
+            if (thread_count == 0) null else thread_count,
+        );
         errdefer model.deinit();
 
         return .{
@@ -1585,7 +1622,7 @@ fn chatLoop(
     load_path: ?[]const u8,
     save_path: ?[]const u8,
 ) !void {
-    var runtime = try GeneratorRuntime.init(allocator, model_dir);
+    var runtime = try GeneratorRuntime.init(allocator, model_dir, options.backend_scheme, options.thread_count);
     defer runtime.deinit();
 
     var history = ChatHistory.init(allocator);
@@ -1780,6 +1817,12 @@ const ChatHistory = struct {
         try writer.writeAll("    \"seed\": ");
         try writer.print("{d}", .{metadata.options.seed});
         try writer.writeAll(",\n");
+        try writer.writeAll("    \"backend\": ");
+        try writer.print("{f}", .{std.json.fmt(metadata.options.backend_scheme.name(), .{})});
+        try writer.writeAll(",\n");
+        try writer.writeAll("    \"threads\": ");
+        try writer.print("{d}", .{metadata.options.thread_count});
+        try writer.writeAll(",\n");
         try writer.writeAll("    \"stream_output\": ");
         try writer.writeAll(if (metadata.options.stream_output) "true" else "false");
         try writer.writeAll(",\n");
@@ -1916,6 +1959,8 @@ test "chat history session save and load preserves tool calls" {
             .seed = 7,
             .stream_output = true,
             .stop_sequences = @constCast(stop_sequences[0..]),
+            .backend_scheme = .q4,
+            .thread_count = 8,
         },
     });
 

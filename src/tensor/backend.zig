@@ -1,4 +1,5 @@
 const std = @import("std");
+const parallel_rows = @import("parallel_rows.zig");
 const quantized = @import("quantized.zig");
 const tensor_store = @import("store.zig");
 
@@ -86,12 +87,13 @@ pub const Backend = union(Scheme) {
         name: []const u8,
         input: []const f32,
         thread_count: usize,
+        pool: ?*parallel_rows.Pool,
         scratch: []u8,
     ) !void {
         switch (self.*) {
-            .bf16 => |*store| try store.matmulVecByNameThreaded(output, name, input, thread_count, scratch),
-            .q8 => |*store| try store.matmulVecByName(output, name, input, thread_count),
-            .q4 => |*store| try store.matmulVecByName(output, name, input, thread_count),
+            .bf16 => |*store| try store.matmulVecByNameThreaded(output, name, input, thread_count, pool, scratch),
+            .q8 => |*store| try store.matmulVecByName(output, name, input, thread_count, pool),
+            .q4 => |*store| try store.matmulVecByName(output, name, input, thread_count, pool),
             .auto => unreachable,
         }
     }

@@ -1,5 +1,6 @@
 const std = @import("std");
 const bfloat16 = @import("bfloat16.zig");
+const parallel_rows = @import("parallel_rows.zig");
 const safetensors = @import("../format/safetensors.zig");
 
 pub const TensorStore = struct {
@@ -119,7 +120,7 @@ pub const TensorStore = struct {
         name: []const u8,
         input: []const f32,
     ) !void {
-        try self.matmulVecByNameThreaded(output, name, input, 1, &.{});
+        try self.matmulVecByNameThreaded(output, name, input, 1, null, &.{});
     }
 
     pub fn matmulVecByNameWithScratch(
@@ -129,7 +130,7 @@ pub const TensorStore = struct {
         input: []const f32,
         scratch: []u8,
     ) !void {
-        try self.matmulVecByNameThreaded(output, name, input, 1, scratch);
+        try self.matmulVecByNameThreaded(output, name, input, 1, null, scratch);
     }
 
     pub fn matmulVecByNameThreaded(
@@ -138,6 +139,7 @@ pub const TensorStore = struct {
         name: []const u8,
         input: []const f32,
         thread_count: usize,
+        pool: ?*parallel_rows.Pool,
         scratch: []u8,
     ) !void {
         _ = scratch;
@@ -147,12 +149,19 @@ pub const TensorStore = struct {
         const rows = std.math.cast(usize, tensor.shape[0]) orelse return error.DimensionTooLarge;
         const cols = std.math.cast(usize, tensor.shape[1]) orelse return error.DimensionTooLarge;
         if (output.len != rows or input.len != cols) return error.SizeMismatch;
+        if (tensor.dtype != .bf16 and tensor.dtype != .f32) return error.UnsupportedTensorDType;
 
-        if (thread_count > 1 and rows >= 8192) {
+        if (shouldParallelize(rows, cols, thread_count, pool != null)) {
+            if (pool) |available_pool| {
+                self.matmulWithPool(output, tensor, input, available_pool);
+                return;
+            }
+        }
+        if (shouldParallelize(rows, cols, thread_count, true)) {
             try self.matmulThreaded(output, tensor, input, thread_count);
             return;
         }
-        try self.matmulRange(output, tensor, input, 0, rows);
+        self.matmulRange(output, tensor, input, 0, rows);
     }
 
     fn readBf16AsF32Into(
@@ -200,7 +209,7 @@ pub const TensorStore = struct {
     ) !void {
         const actual_threads = @min(thread_count, output.len);
         if (actual_threads <= 1) {
-            try self.matmulRange(output, tensor, input, 0, output.len);
+            self.matmulRange(output, tensor, input, 0, output.len);
             return;
         }
 
@@ -215,7 +224,7 @@ pub const TensorStore = struct {
             end_row: usize,
 
             fn run(ctx: *@This()) void {
-                ctx.store.matmulRange(ctx.output, ctx.tensor, ctx.input, ctx.start_row, ctx.end_row) catch unreachable;
+                ctx.store.matmulRange(ctx.output, ctx.tensor, ctx.input, ctx.start_row, ctx.end_row);
             }
         };
 
@@ -240,7 +249,7 @@ pub const TensorStore = struct {
             start_row = end_row;
         }
 
-        try self.matmulRange(output, tensor, input, start_row, output.len);
+        self.matmulRange(output, tensor, input, start_row, output.len);
         for (threads) |thread| thread.join();
     }
 
@@ -251,23 +260,51 @@ pub const TensorStore = struct {
         input: []const f32,
         start_row: usize,
         end_row: usize,
-    ) !void {
+    ) void {
         const cols = input.len;
-        const row_bytes = std.math.cast(usize, try std.math.mul(u64, cols, tensor.dtype.byteSize())) orelse return error.BufferTooLarge;
+        const row_bytes = std.math.cast(usize, @as(u64, cols) * tensor.dtype.byteSize()) orelse unreachable;
 
         for (start_row..end_row) |row_idx| {
-            const row_offset = try std.math.add(
+            const row_offset = std.math.add(
                 u64,
                 tensor.absolute_offset,
-                try std.math.mul(u64, row_idx, row_bytes),
-            );
-            const row = try self.byteRange(row_offset, row_bytes);
+                std.math.mul(u64, row_idx, row_bytes) catch unreachable,
+            ) catch unreachable;
+            const row = self.byteRange(row_offset, row_bytes) catch unreachable;
             output[row_idx] = switch (tensor.dtype) {
                 .bf16 => dotBf16Row(row, input),
                 .f32 => dotF32Row(row, input),
-                else => return error.UnsupportedTensorDType,
+                else => unreachable,
             };
         }
+    }
+
+    fn matmulWithPool(
+        self: *const TensorStore,
+        output: []f32,
+        tensor: safetensors.TensorInfo,
+        input: []const f32,
+        pool: *parallel_rows.Pool,
+    ) void {
+        const Context = struct {
+            store: *const TensorStore,
+            output: []f32,
+            tensor: safetensors.TensorInfo,
+            input: []const f32,
+
+            fn runRange(ctx_ptr: *anyopaque, start_row: usize, end_row: usize) void {
+                const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                ctx.store.matmulRange(ctx.output, ctx.tensor, ctx.input, start_row, end_row);
+            }
+        };
+
+        var context = Context{
+            .store = self,
+            .output = output,
+            .tensor = tensor,
+            .input = input,
+        };
+        pool.run(output.len, &context, Context.runRange);
     }
 
     fn byteRange(self: *const TensorStore, absolute_offset: u64, byte_count: u64) ![]const u8 {
@@ -278,6 +315,12 @@ pub const TensorStore = struct {
         return self.bytes[start..end];
     }
 };
+
+fn shouldParallelize(rows: usize, cols: usize, thread_count: usize, has_parallel_backend: bool) bool {
+    if (!has_parallel_backend or thread_count <= 1) return false;
+    const work = std.math.mul(u64, rows, cols) catch return true;
+    return work >= 1_000_000;
+}
 
 fn dotF32Row(row: []const u8, input: []const f32) f32 {
     var sum: f32 = 0.0;
