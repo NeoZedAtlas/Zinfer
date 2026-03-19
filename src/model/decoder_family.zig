@@ -1,5 +1,6 @@
 const std = @import("std");
 const tensor_store = @import("../tensor/store.zig");
+const logits_util = @import("logits.zig");
 const weights_layout = @import("weights_layout.zig");
 const adapter_config = @import("adapters/qwen3/config.zig");
 const adapter_generation_policy = @import("adapters/qwen3/generation_policy.zig");
@@ -21,7 +22,7 @@ pub const ThinkingMode = adapter_chat_template.ThinkingMode;
 pub const Role = adapter_chat_template.Role;
 pub const ToolCall = adapter_chat_template.ToolCall;
 pub const Message = adapter_chat_template.Message;
-pub const TopLogit = adapter_runtime.TopLogit;
+pub const TopLogit = logits_util.TopLogit;
 pub const CommonWeights = weights_layout.CommonWeights;
 pub const LayerTensorKind = weights_layout.LayerTensorKind;
 
@@ -161,17 +162,17 @@ pub fn prefillTokenIds(
 pub fn topKLogitsAlloc(
     allocator: std.mem.Allocator,
     architecture: Architecture,
-    logits: []const f32,
+    values: []const f32,
     k: usize,
 ) ![]TopLogit {
-    return try entryForArchitecture(architecture).top_k_logits_alloc(allocator, logits, k);
+    return try entryForArchitecture(architecture).top_k_logits_alloc(allocator, values, k);
 }
 
 pub fn argMaxLogit(
     architecture: Architecture,
-    logits: []const f32,
+    values: []const f32,
 ) !usize {
-    return try entryForArchitecture(architecture).arg_max_logit(logits);
+    return try entryForArchitecture(architecture).arg_max_logit(values);
 }
 
 pub fn eosTokenIds(architecture: Architecture) []const u32 {
@@ -408,9 +409,9 @@ fn prefillQwen3TokenIds(
     errdefer if (last_logits) |buffer| allocator.free(buffer);
 
     for (token_ids) |token_id| {
-        const logits = try forwardQwen3TokenId(allocator, store, cfg, cache, token_id);
+        const token_logits = try forwardQwen3TokenId(allocator, store, cfg, cache, token_id);
         if (last_logits) |buffer| allocator.free(buffer);
-        last_logits = logits;
+        last_logits = token_logits;
     }
 
     return last_logits orelse return error.MissingPromptLogits;

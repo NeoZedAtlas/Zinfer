@@ -14,9 +14,12 @@ test {
     _ = @import("kernel/cpu.zig");
     _ = @import("kernel/attention.zig");
     _ = @import("model/kv_cache.zig");
+    _ = @import("model/decoder_cache.zig");
+    _ = @import("model/logits.zig");
+    _ = @import("model/gqa_attention.zig");
+    _ = @import("model/rmsnorm_gqa_swiglu_block.zig");
     _ = @import("model/adapters/qwen3/block.zig");
     _ = @import("model/adapters/qwen3/runtime.zig");
-    _ = @import("model/adapters/qwen3/attention.zig");
     _ = @import("model/adapters/qwen3/spec.zig");
     _ = @import("model/adapters/qwen3/weights.zig");
     _ = @import("model/adapters/qwen3/generation_policy.zig");

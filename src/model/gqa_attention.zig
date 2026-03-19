@@ -1,5 +1,5 @@
 const std = @import("std");
-const attention = @import("../../../kernel/attention.zig");
+const attention = @import("../kernel/attention.zig");
 
 pub const AttentionSpec = struct {
     hidden_size: usize,
@@ -13,12 +13,8 @@ pub const AttentionSpec = struct {
         if (self.num_attention_heads == 0) return error.InvalidAttentionHeads;
         if (self.num_key_value_heads == 0) return error.InvalidKeyValueHeads;
         if (self.head_dim == 0) return error.InvalidHeadDim;
-        if (self.num_attention_heads % self.num_key_value_heads != 0) {
-            return error.InvalidGrouping;
-        }
-        if (self.hidden_size != self.num_attention_heads * self.head_dim) {
-            return error.HiddenSizeMismatch;
-        }
+        if (self.num_attention_heads % self.num_key_value_heads != 0) return error.InvalidGrouping;
+        if (self.hidden_size != self.num_attention_heads * self.head_dim) return error.HiddenSizeMismatch;
     }
 
     pub fn queryGroupSize(self: AttentionSpec) usize {
@@ -79,7 +75,7 @@ pub fn forwardProjectedSingleToken(
     );
 }
 
-test "adapter attention spec validates grouping and dimensions" {
+test "gqa attention spec validates grouping and dimensions" {
     const testing = std.testing;
 
     const spec = AttentionSpec{
