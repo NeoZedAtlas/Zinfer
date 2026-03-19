@@ -10,6 +10,14 @@ pub fn dot(lhs: []const f32, rhs: []const f32) !f32 {
     return sum;
 }
 
+pub fn axpyInPlace(output: []f32, alpha: f32, input: []const f32) !void {
+    if (output.len != input.len) return error.SizeMismatch;
+
+    for (output, input) |*out, value| {
+        out.* += alpha * value;
+    }
+}
+
 pub fn matmulVec(
     output: []f32,
     weights_row_major: []const f32,
@@ -88,6 +96,20 @@ test "dot computes expected result" {
     const lhs = [_]f32{ 1.0, 2.0, 3.0 };
     const rhs = [_]f32{ 4.0, 5.0, 6.0 };
     try testing.expectEqual(@as(f32, 32.0), try dot(&lhs, &rhs));
+}
+
+test "axpyInPlace accumulates scaled input into output" {
+    const testing = std.testing;
+
+    var output = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const input = [_]f32{ 0.5, -1.0, 2.0, 1.5 };
+
+    try axpyInPlace(&output, 2.0, &input);
+
+    try testing.expectApproxEqAbs(@as(f32, 2.0), output[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), output[1], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 7.0), output[2], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 7.0), output[3], 1e-6);
 }
 
 test "matmulVec multiplies row-major matrix by vector" {

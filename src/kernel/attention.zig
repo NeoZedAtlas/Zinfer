@@ -109,9 +109,7 @@ pub fn scaledDotProductAttentionSingleQuery(
             const weight = scores[pos];
             const cache_start = (pos * num_key_value_heads + kv_head_idx) * head_dim;
             const v_slice = value_cache[cache_start .. cache_start + head_dim];
-            for (out_slice, v_slice) |*out, v| {
-                out.* += weight * v;
-            }
+            try cpu.axpyInPlace(out_slice, weight, v_slice);
         }
     }
 }

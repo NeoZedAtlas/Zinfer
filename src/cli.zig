@@ -57,6 +57,16 @@ const ParsedChatInvocation = struct {
     }
 };
 
+const ParsedBenchInvocation = struct {
+    model_dir: []const u8,
+    user_text: []const u8,
+    options: GenerateOptions,
+
+    fn deinit(self: *ParsedBenchInvocation, allocator: std.mem.Allocator) void {
+        self.options.deinit(allocator);
+    }
+};
+
 pub fn run(allocator: std.mem.Allocator) !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
@@ -203,22 +213,10 @@ pub fn run(allocator: std.mem.Allocator) !void {
     }
 
     if (std.mem.eql(u8, command, "bench")) {
-        if (args.len == 3) {
-            try benchPrompt(allocator, default_model_dir, args[2], 16);
-            return;
-        }
-        if (args.len == 4) {
-            const max_new_tokens = try std.fmt.parseInt(usize, args[3], 10);
-            try benchPrompt(allocator, default_model_dir, args[2], max_new_tokens);
-            return;
-        }
-        if (args.len >= 5) {
-            const max_new_tokens = try std.fmt.parseInt(usize, args[4], 10);
-            try benchPrompt(allocator, args[2], args[3], max_new_tokens);
-            return;
-        }
-        try printUsage();
-        return error.InvalidCommand;
+        var invocation = try parseBenchInvocation(allocator, args);
+        defer invocation.deinit(allocator);
+        try benchPrompt(allocator, invocation.model_dir, invocation.user_text, invocation.options);
+        return;
     }
 
     if (std.mem.eql(u8, command, "quantize")) {
@@ -516,6 +514,50 @@ fn parseChatInvocation(
         .options = options,
         .load_path = load_path,
         .save_path = save_path,
+    };
+}
+
+fn parseBenchInvocation(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+) !ParsedBenchInvocation {
+    if (args.len < 3) return error.InvalidCommand;
+
+    var model_dir: []const u8 = default_model_dir;
+    var user_text: []const u8 = undefined;
+    var start_flags: usize = undefined;
+    var options = initGenerateOptions(.disabled, 16);
+
+    if (args.len >= 5) {
+        if (std.fmt.parseInt(usize, args[4], 10)) |max_new_tokens| {
+            model_dir = args[2];
+            user_text = args[3];
+            options.max_new_tokens = max_new_tokens;
+            start_flags = 5;
+        } else |_| {
+            model_dir = default_model_dir;
+            user_text = args[2];
+            start_flags = 3;
+            if (args.len > start_flags and !isFlagArg(args[start_flags])) {
+                options.max_new_tokens = try std.fmt.parseInt(usize, args[start_flags], 10);
+                start_flags += 1;
+            }
+        }
+    } else {
+        model_dir = default_model_dir;
+        user_text = args[2];
+        start_flags = 3;
+        if (args.len > start_flags and !isFlagArg(args[start_flags])) {
+            options.max_new_tokens = try std.fmt.parseInt(usize, args[start_flags], 10);
+            start_flags += 1;
+        }
+    }
+
+    try parseGenerateFlags(allocator, args[start_flags..], &options);
+    return .{
+        .model_dir = model_dir,
+        .user_text = user_text,
+        .options = options,
     };
 }
 
@@ -996,13 +1038,19 @@ fn benchPrompt(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
     user_text: []const u8,
-    max_new_tokens: usize,
+    options: GenerateOptions,
 ) !void {
-    var runtime = try GeneratorRuntime.init(allocator, model_dir, .auto, 0);
+    var runtime = try GeneratorRuntime.init(allocator, model_dir, options.backend_scheme, options.thread_count);
     defer runtime.deinit();
     const cfg = runtime.model.cfg;
 
-    const prompt = try buildSingleUserPromptAlloc(allocator, cfg.architecture, user_text, null, .disabled);
+    const prompt = try buildSingleUserPromptAlloc(
+        allocator,
+        cfg.architecture,
+        user_text,
+        options.system_prompt,
+        options.thinking_mode,
+    );
     defer allocator.free(prompt);
 
     var tokenize_timer = try std.time.Timer.start();
@@ -1020,12 +1068,12 @@ fn benchPrompt(
     var cache = try decoder_family.ModelCache.init(
         allocator,
         cfg.num_hidden_layers,
-        prompt_ids.len + max_new_tokens,
+        prompt_ids.len + options.max_new_tokens,
         cfg.num_key_value_heads,
         cfg.head_dim,
     );
     defer cache.deinit();
-    var workspace = try runtime.model.initWorkspace(prompt_ids.len + max_new_tokens);
+    var workspace = try runtime.model.initWorkspace(prompt_ids.len + options.max_new_tokens);
     defer workspace.deinit();
 
     var prefill_timer = try std.time.Timer.start();
@@ -1035,7 +1083,7 @@ fn benchPrompt(
     var decode_timer = try std.time.Timer.start();
     var decoded_tokens: usize = 0;
     var current_logits = last_logits;
-    for (0..max_new_tokens) |_| {
+    for (0..options.max_new_tokens) |_| {
         const next_token = try decoder_family.argMaxLogit(current_logits);
         if (decoder_family.isEosToken(cfg.architecture, next_token)) {
             break;
@@ -1047,11 +1095,12 @@ fn benchPrompt(
     const decode_ns = decode_timer.read();
 
     const weights_size = try weightArtifactSize(allocator, model_dir, runtime.model.backendName());
-    const kv_cache_bytes = estimateKvCacheBytes(cfg, prompt_ids.len + max_new_tokens);
+    const kv_cache_bytes = estimateKvCacheBytes(cfg, prompt_ids.len + options.max_new_tokens);
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("Zinfer benchmark\n", .{});
     try stdout.print("model_dir: {s}\n", .{model_dir});
     try stdout.print("backend: {s}\n", .{runtime.model.backendName()});
+    try stdout.print("threads: {d}\n", .{runtime.model.thread_count});
     try stdout.print("prompt_tokens: {d}\n", .{prompt_ids.len});
     try stdout.print("decode_tokens: {d}\n", .{decoded_tokens});
     try stdout.print("tokenize_ms: {d:.3}\n", .{nsToMs(tokenize_ns)});
