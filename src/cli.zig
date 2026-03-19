@@ -854,7 +854,7 @@ fn probeModel(
 
     const logits = try decoder_runtime.forwardTokenId(allocator, &store, cfg, &cache, token_id);
     defer allocator.free(logits);
-    const top = try decoder_runtime.topKLogitsAlloc(allocator, logits, top_k);
+    const top = try decoder_runtime.topKLogitsAlloc(allocator, cfg, logits, top_k);
     defer allocator.free(top);
 
     const stdout = std.fs.File.stdout().deprecatedWriter();
@@ -907,7 +907,7 @@ fn generateTokenIds(
 
     for (0..steps) |_| {
         const current_logits = last_logits orelse return error.MissingPromptLogits;
-        const next_token = try decoder_runtime.argMaxLogit(current_logits);
+        const next_token = try decoder_runtime.argMaxLogit(cfg, current_logits);
         generated[generated_len] = next_token;
         generated_len += 1;
         last_token = next_token;
