@@ -5,8 +5,31 @@ const tensor_store = @import("../tensor/store.zig");
 pub const Architecture = decoder_family.Architecture;
 pub const DecoderConfig = decoder_family.DecoderConfig;
 pub const ParsedConfig = decoder_family.ParsedConfig;
-pub const ModelCache = decoder_family.ModelCache;
 pub const TopLogit = decoder_family.TopLogit;
+
+pub const ModelCache = struct {
+    inner: decoder_family.ModelCache,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        cfg: DecoderConfig,
+        max_seq_len: usize,
+    ) !ModelCache {
+        return .{
+            .inner = try decoder_family.ModelCache.init(
+                allocator,
+                cfg.num_hidden_layers,
+                max_seq_len,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+            ),
+        };
+    }
+
+    pub fn deinit(self: *ModelCache) void {
+        self.inner.deinit();
+    }
+};
 
 pub fn loadConfigFromFile(backing_allocator: std.mem.Allocator, path: []const u8) !ParsedConfig {
     return try decoder_family.loadConfigFromFile(backing_allocator, path);
@@ -19,7 +42,7 @@ pub fn forwardTokenId(
     cache: *ModelCache,
     token_id: usize,
 ) ![]f32 {
-    return try decoder_family.forwardTokenId(allocator, store, cfg, cache, token_id);
+    return try decoder_family.forwardTokenId(allocator, store, cfg, &cache.inner, token_id);
 }
 
 pub fn prefillTokenIds(
@@ -29,7 +52,7 @@ pub fn prefillTokenIds(
     cache: *ModelCache,
     token_ids: []const usize,
 ) ![]f32 {
-    return try decoder_family.prefillTokenIds(allocator, store, cfg, cache, token_ids);
+    return try decoder_family.prefillTokenIds(allocator, store, cfg, &cache.inner, token_ids);
 }
 
 pub fn topKLogitsAlloc(

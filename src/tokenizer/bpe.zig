@@ -530,7 +530,7 @@ fn isLikelyPunctuation(cp: u21) bool {
     };
 }
 
-test "adapter tokenizer encodes known samples" {
+test "bpe tokenizer encodes known samples" {
     const testing = std.testing;
     var tokenizer = try Tokenizer.loadFromModelDir(testing.allocator, "models/Qwen3-0.6B");
     defer tokenizer.deinit();
@@ -557,7 +557,7 @@ test "adapter tokenizer encodes known samples" {
     }
 }
 
-test "adapter tokenizer decodes known samples" {
+test "bpe tokenizer decodes known samples" {
     const testing = std.testing;
     var tokenizer = try Tokenizer.loadFromModelDir(testing.allocator, "models/Qwen3-0.6B");
     defer tokenizer.deinit();

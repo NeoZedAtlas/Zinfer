@@ -1,37 +1,11 @@
 const std = @import("std");
-const adapter_tokenizer = @import("tokenizer.zig");
+const bpe_tokenizer = @import("../../../tokenizer/bpe.zig");
+const chat_types = @import("../../chat_types.zig");
 
-pub const ThinkingMode = enum {
-    enabled,
-    disabled,
-};
-
-pub const Role = enum {
-    system,
-    user,
-    assistant,
-    tool,
-
-    pub fn name(self: Role) []const u8 {
-        return switch (self) {
-            .system => "system",
-            .user => "user",
-            .assistant => "assistant",
-            .tool => "tool",
-        };
-    }
-};
-
-pub const ToolCall = struct {
-    name: []const u8,
-    arguments_json: []const u8,
-};
-
-pub const Message = struct {
-    role: Role,
-    content: []const u8,
-    tool_calls: []const ToolCall = &.{},
-};
+pub const ThinkingMode = chat_types.ThinkingMode;
+pub const Role = chat_types.Role;
+pub const ToolCall = chat_types.ToolCall;
+pub const Message = chat_types.Message;
 
 pub fn renderSingleUserPromptAlloc(
     allocator: std.mem.Allocator,
@@ -159,7 +133,7 @@ test "single user prompt matches adapter thinking template" {
         prompt,
     );
 
-    var tokenizer = try adapter_tokenizer.Tokenizer.loadFromModelDir(testing.allocator, "models/Qwen3-0.6B");
+    var tokenizer = try bpe_tokenizer.Tokenizer.loadFromModelDir(testing.allocator, "models/Qwen3-0.6B");
     defer tokenizer.deinit();
 
     const ids = try tokenizer.encodeAlloc(testing.allocator, prompt);
@@ -177,7 +151,7 @@ test "single user prompt matches adapter non-thinking template" {
         prompt,
     );
 
-    var tokenizer = try adapter_tokenizer.Tokenizer.loadFromModelDir(testing.allocator, "models/Qwen3-0.6B");
+    var tokenizer = try bpe_tokenizer.Tokenizer.loadFromModelDir(testing.allocator, "models/Qwen3-0.6B");
     defer tokenizer.deinit();
 
     const ids = try tokenizer.encodeAlloc(testing.allocator, prompt);

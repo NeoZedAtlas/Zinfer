@@ -1,80 +1,30 @@
 const std = @import("std");
 const tensor_store = @import("../tensor/store.zig");
 const kv_cache = @import("kv_cache.zig");
+const decoder_cache = @import("decoder_cache.zig");
+const decoder_only_stack = @import("decoder_only_stack.zig");
+const chat_types = @import("chat_types.zig");
+const decoder_registry = @import("decoder_registry.zig");
+const decoder_types = @import("decoder_types.zig");
 const generic_block = @import("rmsnorm_gqa_swiglu_block.zig");
 const logits_util = @import("logits.zig");
 const weights_layout = @import("weights_layout.zig");
-const adapter_config = @import("adapters/qwen3/config.zig");
-const adapter_generation_policy = @import("adapters/qwen3/generation_policy.zig");
-const adapter_layout = @import("adapters/qwen3/layout.zig");
-const adapter_runtime = @import("adapters/qwen3/runtime.zig");
-const adapter_tokenizer = @import("adapters/qwen3/tokenizer.zig");
-const adapter_chat_template = @import("adapters/qwen3/chat_template.zig");
-const adapter_weights = @import("adapters/qwen3/weights.zig");
+const qwen3_family = @import("adapters/qwen3/family.zig");
 
-pub const Architecture = enum {
-    qwen3,
-
-    pub fn name(self: Architecture) []const u8 {
-        return entryForArchitecture(self).model_type;
-    }
-};
-
-pub const ThinkingMode = adapter_chat_template.ThinkingMode;
-pub const Role = adapter_chat_template.Role;
-pub const ToolCall = adapter_chat_template.ToolCall;
-pub const Message = adapter_chat_template.Message;
+pub const Architecture = decoder_types.Architecture;
+pub const ThinkingMode = chat_types.ThinkingMode;
+pub const Role = chat_types.Role;
+pub const ToolCall = chat_types.ToolCall;
+pub const Message = chat_types.Message;
 pub const TopLogit = logits_util.TopLogit;
 pub const CommonWeights = weights_layout.CommonWeights;
 pub const LayerTensorKind = weights_layout.LayerTensorKind;
-
-pub const DecoderConfig = struct {
-    architecture: Architecture,
-    model_type: []const u8,
-    hidden_size: usize,
-    intermediate_size: usize,
-    num_hidden_layers: usize,
-    num_attention_heads: usize,
-    num_key_value_heads: usize,
-    head_dim: usize,
-    vocab_size: usize,
-    max_position_embeddings: usize,
-    rope_theta: f64,
-    rms_norm_eps: f64,
-    torch_dtype: []const u8,
-    tie_word_embeddings: bool,
-};
-
-pub const ParsedConfig = struct {
-    arena: std.heap.ArenaAllocator,
-    value: DecoderConfig,
-
-    pub fn deinit(self: *ParsedConfig) void {
-        self.arena.deinit();
-    }
-};
-
-pub const ModelCache = struct {
-    architecture: Architecture,
-    qwen3: adapter_runtime.ModelCache,
-
-    pub fn init(
-        allocator: std.mem.Allocator,
-        cfg: DecoderConfig,
-        max_seq_len: usize,
-    ) !ModelCache {
-        return try entryForArchitecture(cfg.architecture).init_model_cache(allocator, cfg, max_seq_len);
-    }
-
-    pub fn deinit(self: *ModelCache) void {
-        switch (self.architecture) {
-            .qwen3 => self.qwen3.deinit(),
-        }
-    }
-};
+pub const ModelCache = decoder_cache.ModelCache;
+pub const DecoderConfig = decoder_types.DecoderConfig;
+pub const ParsedConfig = decoder_types.ParsedConfig;
 
 pub const Tokenizer = union(Architecture) {
-    qwen3: adapter_tokenizer.Tokenizer,
+    qwen3: qwen3_family.TokenizerImpl,
 
     pub fn loadFromModelDir(
         backing_allocator: std.mem.Allocator,
@@ -103,24 +53,7 @@ pub const Tokenizer = union(Architecture) {
     }
 };
 
-const Entry = struct {
-    model_type: []const u8,
-    load_config_from_file: *const fn (std.mem.Allocator, []const u8) anyerror!ParsedConfig,
-    init_model_cache: *const fn (std.mem.Allocator, DecoderConfig, usize) anyerror!ModelCache,
-    forward_token_id: *const fn (std.mem.Allocator, *const tensor_store.TensorStore, DecoderConfig, *ModelCache, usize) anyerror![]f32,
-    forward_single_block: *const fn (std.mem.Allocator, *const tensor_store.TensorStore, DecoderConfig, usize, *kv_cache.LayerKVCache, []const f32, []f32) anyerror!void,
-    prefill_token_ids: *const fn (std.mem.Allocator, *const tensor_store.TensorStore, DecoderConfig, *ModelCache, []const usize) anyerror![]f32,
-    top_k_logits_alloc: *const fn (std.mem.Allocator, []const f32, usize) anyerror![]TopLogit,
-    arg_max_logit: *const fn ([]const f32) anyerror!usize,
-    eos_token_ids: []const u32,
-    default_stop_sequences: []const []const u8,
-    common_weights: CommonWeights,
-    layer_tensor_name_alloc: *const fn (std.mem.Allocator, usize, LayerTensorKind) anyerror![]u8,
-    load_tokenizer: *const fn (std.mem.Allocator, []const u8) anyerror!Tokenizer,
-    render_messages_prompt_alloc: *const fn (std.mem.Allocator, []const Message, ThinkingMode) anyerror![]u8,
-    render_single_user_prompt_alloc: *const fn (std.mem.Allocator, []const u8, ThinkingMode) anyerror![]u8,
-    assistant_history_content: *const fn ([]const u8) []const u8,
-};
+const Entry = decoder_registry.Entry(Tokenizer);
 
 pub fn detectArchitecture(model_type: []const u8) ?Architecture {
     inline for (std.meta.tags(Architecture)) |tag| {
@@ -149,7 +82,16 @@ pub fn forwardTokenId(
     cache: *ModelCache,
     token_id: usize,
 ) ![]f32 {
-    return try entryForArchitecture(cfg.architecture).forward_token_id(allocator, store, cfg, cache, token_id);
+    return try decoder_only_stack.forwardTokenId(
+        allocator,
+        store,
+        decoder_only_stack.Config.fromDecoderConfig(cfg),
+        commonWeights(cfg.architecture),
+        entryForArchitecture(cfg.architecture).layer_layout,
+        entryForArchitecture(cfg.architecture).layer_tensor_name_alloc,
+        cache,
+        token_id,
+    );
 }
 
 pub fn prefillTokenIds(
@@ -159,7 +101,18 @@ pub fn prefillTokenIds(
     cache: *ModelCache,
     token_ids: []const usize,
 ) ![]f32 {
-    return try entryForArchitecture(cfg.architecture).prefill_token_ids(allocator, store, cfg, cache, token_ids);
+    if (token_ids.len == 0) return error.EmptyPrompt;
+
+    var last_logits: ?[]f32 = null;
+    errdefer if (last_logits) |buffer| allocator.free(buffer);
+
+    for (token_ids) |token_id| {
+        const token_logits = try forwardTokenId(allocator, store, cfg, cache, token_id);
+        if (last_logits) |buffer| allocator.free(buffer);
+        last_logits = token_logits;
+    }
+
+    return last_logits orelse return error.MissingPromptLogits;
 }
 
 pub fn forwardSingleBlock(
@@ -171,11 +124,12 @@ pub fn forwardSingleBlock(
     hidden_in: []const f32,
     hidden_out: []f32,
 ) !void {
-    return try entryForArchitecture(cfg.architecture).forward_single_block(
+    return try generic_block.forwardSingleToken(
         allocator,
         store,
-        cfg,
-        layer_index,
+        decoder_only_stack.Config.fromDecoderConfig(cfg).blockSpec(layer_index),
+        entryForArchitecture(cfg.architecture).layer_layout,
+        entryForArchitecture(cfg.architecture).layer_tensor_name_alloc,
         cache,
         hidden_in,
         hidden_out,
@@ -188,14 +142,16 @@ pub fn topKLogitsAlloc(
     values: []const f32,
     k: usize,
 ) ![]TopLogit {
-    return try entryForArchitecture(architecture).top_k_logits_alloc(allocator, values, k);
+    _ = architecture;
+    return try logits_util.topKLogitsAlloc(allocator, values, k);
 }
 
 pub fn argMaxLogit(
     architecture: Architecture,
     values: []const f32,
 ) !usize {
-    return try entryForArchitecture(architecture).arg_max_logit(values);
+    _ = architecture;
+    return try logits_util.argMaxLogit(values);
 }
 
 pub fn eosTokenIds(architecture: Architecture) []const u32 {
@@ -293,22 +249,17 @@ pub fn assistantHistoryContent(
 fn entryForArchitecture(architecture: Architecture) Entry {
     return switch (architecture) {
         .qwen3 => .{
-            .model_type = "qwen3",
-            .load_config_from_file = loadQwen3ConfigFromFile,
-            .init_model_cache = initQwen3ModelCache,
-            .forward_token_id = forwardQwen3TokenId,
-            .forward_single_block = forwardQwen3SingleBlock,
-            .prefill_token_ids = prefillQwen3TokenIds,
-            .top_k_logits_alloc = adapter_runtime.topKLogitsAlloc,
-            .arg_max_logit = adapter_runtime.argMaxLogit,
-            .eos_token_ids = adapter_generation_policy.eos_token_ids,
-            .default_stop_sequences = adapter_generation_policy.default_stop_sequences,
-            .common_weights = adapter_weights.common_weights,
-            .layer_tensor_name_alloc = adapter_weights.layerTensorNameAlloc,
+            .model_type = qwen3_family.model_type,
+            .load_config_from_file = qwen3_family.loadParsedConfig,
+            .layer_layout = qwen3_family.layer_layout,
+            .eos_token_ids = qwen3_family.eos_token_ids,
+            .default_stop_sequences = qwen3_family.default_stop_sequences,
+            .common_weights = qwen3_family.common_weights,
+            .layer_tensor_name_alloc = qwen3_family.layerTensorNameAlloc,
             .load_tokenizer = loadQwen3TokenizerFromModelDir,
-            .render_messages_prompt_alloc = adapter_chat_template.renderMessagesPromptAlloc,
-            .render_single_user_prompt_alloc = adapter_chat_template.renderSingleUserPromptAlloc,
-            .assistant_history_content = adapter_chat_template.assistantHistoryContent,
+            .render_messages_prompt_alloc = qwen3_family.renderMessagesPromptAlloc,
+            .render_single_user_prompt_alloc = qwen3_family.renderSingleUserPromptAlloc,
+            .assistant_history_content = qwen3_family.assistantHistoryContent,
         },
     };
 }
@@ -342,146 +293,12 @@ fn readFileAllocAtPath(
     return std.fs.cwd().readFileAlloc(allocator, path, max_bytes);
 }
 
-fn loadQwen3ConfigFromFile(backing_allocator: std.mem.Allocator, path: []const u8) !ParsedConfig {
-    var parsed = try adapter_config.loadFromFile(backing_allocator, path);
-    errdefer parsed.deinit();
-
-    return .{
-        .arena = parsed.arena,
-        .value = .{
-            .architecture = .qwen3,
-            .model_type = parsed.value.model_type,
-            .hidden_size = parsed.value.hidden_size,
-            .intermediate_size = parsed.value.intermediate_size,
-            .num_hidden_layers = parsed.value.num_hidden_layers,
-            .num_attention_heads = parsed.value.num_attention_heads,
-            .num_key_value_heads = parsed.value.num_key_value_heads,
-            .head_dim = parsed.value.head_dim,
-            .vocab_size = parsed.value.vocab_size,
-            .max_position_embeddings = parsed.value.max_position_embeddings,
-            .rope_theta = parsed.value.rope_theta,
-            .rms_norm_eps = parsed.value.rms_norm_eps,
-            .torch_dtype = parsed.value.torch_dtype,
-            .tie_word_embeddings = parsed.value.tie_word_embeddings,
-        },
-    };
-}
-
-fn qwen3ConfigFromDecoder(cfg: DecoderConfig) adapter_config.Config {
-    return .{
-        .architectures = &.{},
-        .head_dim = cfg.head_dim,
-        .hidden_size = cfg.hidden_size,
-        .intermediate_size = cfg.intermediate_size,
-        .max_position_embeddings = cfg.max_position_embeddings,
-        .model_type = cfg.model_type,
-        .num_attention_heads = cfg.num_attention_heads,
-        .num_hidden_layers = cfg.num_hidden_layers,
-        .num_key_value_heads = cfg.num_key_value_heads,
-        .rms_norm_eps = cfg.rms_norm_eps,
-        .rope_theta = cfg.rope_theta,
-        .tie_word_embeddings = cfg.tie_word_embeddings,
-        .torch_dtype = cfg.torch_dtype,
-        .vocab_size = cfg.vocab_size,
-    };
-}
-
-fn initQwen3ModelCache(
-    allocator: std.mem.Allocator,
-    cfg: DecoderConfig,
-    max_seq_len: usize,
-) !ModelCache {
-    return .{
-        .architecture = .qwen3,
-        .qwen3 = try adapter_runtime.ModelCache.init(
-            allocator,
-            cfg.num_hidden_layers,
-            max_seq_len,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-        ),
-    };
-}
-
-fn forwardQwen3TokenId(
-    allocator: std.mem.Allocator,
-    store: *const tensor_store.TensorStore,
-    cfg: DecoderConfig,
-    cache: *ModelCache,
-    token_id: usize,
-) ![]f32 {
-    if (cache.architecture != .qwen3) return error.ModelCacheArchitectureMismatch;
-    return try adapter_runtime.forwardTokenId(
-        allocator,
-        store,
-        qwen3ConfigFromDecoder(cfg),
-        &cache.qwen3,
-        token_id,
-    );
-}
-
-fn forwardQwen3SingleBlock(
-    allocator: std.mem.Allocator,
-    store: *const tensor_store.TensorStore,
-    cfg: DecoderConfig,
-    layer_index: usize,
-    cache: *kv_cache.LayerKVCache,
-    hidden_in: []const f32,
-    hidden_out: []f32,
-) !void {
-    return try generic_block.forwardSingleToken(
-        allocator,
-        store,
-        decoderStackConfig(cfg).blockSpec(layer_index),
-        adapter_layout.layer_layout,
-        adapter_weights.layerTensorNameAlloc,
-        cache,
-        hidden_in,
-        hidden_out,
-    );
-}
-
-fn prefillQwen3TokenIds(
-    allocator: std.mem.Allocator,
-    store: *const tensor_store.TensorStore,
-    cfg: DecoderConfig,
-    cache: *ModelCache,
-    token_ids: []const usize,
-) ![]f32 {
-    if (token_ids.len == 0) return error.EmptyPrompt;
-
-    var last_logits: ?[]f32 = null;
-    errdefer if (last_logits) |buffer| allocator.free(buffer);
-
-    for (token_ids) |token_id| {
-        const token_logits = try forwardQwen3TokenId(allocator, store, cfg, cache, token_id);
-        if (last_logits) |buffer| allocator.free(buffer);
-        last_logits = token_logits;
-    }
-
-    return last_logits orelse return error.MissingPromptLogits;
-}
-
-fn decoderStackConfig(cfg: DecoderConfig) @import("decoder_only_stack.zig").Config {
-    return .{
-        .hidden_size = cfg.hidden_size,
-        .intermediate_size = cfg.intermediate_size,
-        .num_hidden_layers = cfg.num_hidden_layers,
-        .num_attention_heads = cfg.num_attention_heads,
-        .num_key_value_heads = cfg.num_key_value_heads,
-        .head_dim = cfg.head_dim,
-        .vocab_size = cfg.vocab_size,
-        .rope_theta = cfg.rope_theta,
-        .rms_norm_eps = cfg.rms_norm_eps,
-    };
-}
-
 fn loadQwen3TokenizerFromModelDir(
     backing_allocator: std.mem.Allocator,
     model_dir: []const u8,
 ) !Tokenizer {
     return .{
-        .qwen3 = try adapter_tokenizer.Tokenizer.loadFromModelDir(backing_allocator, model_dir),
+        .qwen3 = try qwen3_family.loadTokenizerFromModelDir(backing_allocator, model_dir),
     };
 }
 

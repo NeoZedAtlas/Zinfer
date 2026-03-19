@@ -1,6 +1,7 @@
 const std = @import("std");
 const cpu = @import("../kernel/cpu.zig");
 const decoder_cache = @import("decoder_cache.zig");
+const decoder_types = @import("decoder_types.zig");
 const generic_block = @import("rmsnorm_gqa_swiglu_block.zig");
 const tensor_store = @import("../tensor/store.zig");
 const weights_layout = @import("weights_layout.zig");
@@ -26,6 +27,20 @@ pub const Config = struct {
             .head_dim = self.head_dim,
             .rope_theta = @floatCast(self.rope_theta),
             .rms_norm_eps = @floatCast(self.rms_norm_eps),
+        };
+    }
+
+    pub fn fromDecoderConfig(cfg: decoder_types.DecoderConfig) Config {
+        return .{
+            .hidden_size = cfg.hidden_size,
+            .intermediate_size = cfg.intermediate_size,
+            .num_hidden_layers = cfg.num_hidden_layers,
+            .num_attention_heads = cfg.num_attention_heads,
+            .num_key_value_heads = cfg.num_key_value_heads,
+            .head_dim = cfg.head_dim,
+            .vocab_size = cfg.vocab_size,
+            .rope_theta = cfg.rope_theta,
+            .rms_norm_eps = cfg.rms_norm_eps,
         };
     }
 };
