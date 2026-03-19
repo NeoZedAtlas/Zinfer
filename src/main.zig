@@ -19,6 +19,7 @@ test {
     _ = @import("model/adapters/qwen3/attention.zig");
     _ = @import("model/adapters/qwen3/spec.zig");
     _ = @import("model/adapters/qwen3/weights.zig");
+    _ = @import("model/adapters/qwen3/generation_policy.zig");
     _ = @import("model/decoder_family.zig");
     _ = @import("model/decoder_runtime.zig");
     _ = @import("model/weights_layout.zig");

@@ -1195,10 +1195,6 @@ fn thinkingModeName(mode: decoder_family.ThinkingMode) []const u8 {
     };
 }
 
-fn isEosToken(token_id: usize) bool {
-    return token_id == 151645 or token_id == 151643;
-}
-
 const LoadedChatMessages = struct {
     arena: std.heap.ArenaAllocator,
     items: []decoder_family.Message,
@@ -1349,14 +1345,21 @@ const GeneratorRuntime = struct {
         var cache = try decoder_runtime.ModelCache.init(self.allocator, cfg, prompt_ids.len + options.max_new_tokens);
         defer cache.deinit();
 
-        var last_logits: ?[]f32 = null;
-        defer if (last_logits) |buffer| self.allocator.free(buffer);
+        const effective_stop_sequences = try decoder_runtime.effectiveStopSequencesAlloc(
+            self.allocator,
+            cfg,
+            options.stop_sequences,
+        );
+        defer self.allocator.free(effective_stop_sequences);
 
-        for (prompt_ids) |token_id| {
-            const logits = try decoder_runtime.forwardTokenId(self.allocator, &self.store, cfg, &cache, token_id);
-            if (last_logits) |buffer| self.allocator.free(buffer);
-            last_logits = logits;
-        }
+        var last_logits: ?[]f32 = try decoder_runtime.prefillTokenIds(
+            self.allocator,
+            &self.store,
+            cfg,
+            &cache,
+            prompt_ids,
+        );
+        defer if (last_logits) |buffer| self.allocator.free(buffer);
 
         var generated = std.ArrayListUnmanaged(u32).empty;
         defer generated.deinit(self.allocator);
@@ -1370,7 +1373,7 @@ const GeneratorRuntime = struct {
         for (0..options.max_new_tokens) |_| {
             const current_logits = last_logits orelse return error.MissingPromptLogits;
             const next_token = try sampler.sampleToken(self.allocator, prng.random(), current_logits, history_ids.items, options.sampling);
-            if (isEosToken(next_token)) {
+            if (decoder_runtime.isEosToken(cfg, next_token)) {
                 self.allocator.free(current_logits);
                 last_logits = null;
                 break;
@@ -1378,7 +1381,9 @@ const GeneratorRuntime = struct {
 
             try generated.append(self.allocator, std.math.cast(u32, next_token) orelse return error.TokenIdOutOfRange);
             try history_ids.append(self.allocator, next_token);
-            if (try analyzeAndMaybeStream(self.allocator, &self.tokenizer, generated.items, options, stdout, &streamed_len)) |trimmed| {
+            var effective_options = options;
+            effective_options.stop_sequences = effective_stop_sequences;
+            if (try analyzeAndMaybeStream(self.allocator, &self.tokenizer, generated.items, effective_options, stdout, &streamed_len)) |trimmed| {
                 self.allocator.free(current_logits);
                 last_logits = null;
                 return trimmed;

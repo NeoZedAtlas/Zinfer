@@ -2,6 +2,7 @@ const std = @import("std");
 const tensor_store = @import("../tensor/store.zig");
 const weights_layout = @import("weights_layout.zig");
 const adapter_config = @import("adapters/qwen3/config.zig");
+const adapter_generation_policy = @import("adapters/qwen3/generation_policy.zig");
 const adapter_runtime = @import("adapters/qwen3/runtime.zig");
 const adapter_spec = @import("adapters/qwen3/spec.zig");
 const adapter_tokenizer = @import("adapters/qwen3/tokenizer.zig");
@@ -104,8 +105,11 @@ const Entry = struct {
     load_config_from_file: *const fn (std.mem.Allocator, []const u8) anyerror!ParsedConfig,
     init_model_cache: *const fn (std.mem.Allocator, DecoderConfig, usize) anyerror!ModelCache,
     forward_token_id: *const fn (std.mem.Allocator, *const tensor_store.TensorStore, DecoderConfig, *ModelCache, usize) anyerror![]f32,
+    prefill_token_ids: *const fn (std.mem.Allocator, *const tensor_store.TensorStore, DecoderConfig, *ModelCache, []const usize) anyerror![]f32,
     top_k_logits_alloc: *const fn (std.mem.Allocator, []const f32, usize) anyerror![]TopLogit,
     arg_max_logit: *const fn ([]const f32) anyerror!usize,
+    eos_token_ids: []const u32,
+    default_stop_sequences: []const []const u8,
     common_weights: CommonWeights,
     layer_tensor_name_alloc: *const fn (std.mem.Allocator, usize, LayerTensorKind) anyerror![]u8,
     load_tokenizer: *const fn (std.mem.Allocator, []const u8) anyerror!Tokenizer,
@@ -144,6 +148,16 @@ pub fn forwardTokenId(
     return try entryForArchitecture(cfg.architecture).forward_token_id(allocator, store, cfg, cache, token_id);
 }
 
+pub fn prefillTokenIds(
+    allocator: std.mem.Allocator,
+    store: *const tensor_store.TensorStore,
+    cfg: DecoderConfig,
+    cache: *ModelCache,
+    token_ids: []const usize,
+) ![]f32 {
+    return try entryForArchitecture(cfg.architecture).prefill_token_ids(allocator, store, cfg, cache, token_ids);
+}
+
 pub fn topKLogitsAlloc(
     allocator: std.mem.Allocator,
     architecture: Architecture,
@@ -158,6 +172,60 @@ pub fn argMaxLogit(
     logits: []const f32,
 ) !usize {
     return try entryForArchitecture(architecture).arg_max_logit(logits);
+}
+
+pub fn eosTokenIds(architecture: Architecture) []const u32 {
+    return entryForArchitecture(architecture).eos_token_ids;
+}
+
+pub fn isEosToken(architecture: Architecture, token_id: usize) bool {
+    for (eosTokenIds(architecture)) |eos_id| {
+        if (token_id == eos_id) return true;
+    }
+    return false;
+}
+
+pub fn defaultStopSequences(architecture: Architecture) []const []const u8 {
+    return entryForArchitecture(architecture).default_stop_sequences;
+}
+
+pub fn effectiveStopSequencesAlloc(
+    allocator: std.mem.Allocator,
+    architecture: Architecture,
+    extra_stop_sequences: [][]const u8,
+) ![][]const u8 {
+    const defaults = defaultStopSequences(architecture);
+    var unique_extra_count: usize = 0;
+
+    for (extra_stop_sequences, 0..) |stop_sequence, idx| {
+        if (containsStopSequence(defaults, stop_sequence)) continue;
+        if (containsStopSequence(extra_stop_sequences[0..idx], stop_sequence)) continue;
+        unique_extra_count += 1;
+    }
+
+    const combined = try allocator.alloc([]const u8, defaults.len + unique_extra_count);
+    var count: usize = 0;
+
+    for (defaults) |stop_sequence| {
+        combined[count] = stop_sequence;
+        count += 1;
+    }
+
+    for (extra_stop_sequences, 0..) |stop_sequence, idx| {
+        if (containsStopSequence(defaults, stop_sequence)) continue;
+        if (containsStopSequence(extra_stop_sequences[0..idx], stop_sequence)) continue;
+        combined[count] = stop_sequence;
+        count += 1;
+    }
+
+    return combined;
+}
+
+fn containsStopSequence(haystack: []const []const u8, needle: []const u8) bool {
+    for (haystack) |existing| {
+        if (std.mem.eql(u8, existing, needle)) return true;
+    }
+    return false;
 }
 
 pub fn commonWeights(architecture: Architecture) CommonWeights {
@@ -205,8 +273,11 @@ fn entryForArchitecture(architecture: Architecture) Entry {
             .load_config_from_file = loadQwen3ConfigFromFile,
             .init_model_cache = initQwen3ModelCache,
             .forward_token_id = forwardQwen3TokenId,
+            .prefill_token_ids = prefillQwen3TokenIds,
             .top_k_logits_alloc = adapter_runtime.topKLogitsAlloc,
             .arg_max_logit = adapter_runtime.argMaxLogit,
+            .eos_token_ids = adapter_generation_policy.eos_token_ids,
+            .default_stop_sequences = adapter_generation_policy.default_stop_sequences,
             .common_weights = adapter_weights.common_weights,
             .layer_tensor_name_alloc = adapter_weights.layerTensorNameAlloc,
             .load_tokenizer = loadQwen3TokenizerFromModelDir,
@@ -324,6 +395,27 @@ fn forwardQwen3TokenId(
     );
 }
 
+fn prefillQwen3TokenIds(
+    allocator: std.mem.Allocator,
+    store: *const tensor_store.TensorStore,
+    cfg: DecoderConfig,
+    cache: *ModelCache,
+    token_ids: []const usize,
+) ![]f32 {
+    if (token_ids.len == 0) return error.EmptyPrompt;
+
+    var last_logits: ?[]f32 = null;
+    errdefer if (last_logits) |buffer| allocator.free(buffer);
+
+    for (token_ids) |token_id| {
+        const logits = try forwardQwen3TokenId(allocator, store, cfg, cache, token_id);
+        if (last_logits) |buffer| allocator.free(buffer);
+        last_logits = logits;
+    }
+
+    return last_logits orelse return error.MissingPromptLogits;
+}
+
 fn loadQwen3TokenizerFromModelDir(
     backing_allocator: std.mem.Allocator,
     model_dir: []const u8,
@@ -375,4 +467,22 @@ test "family exposes qwen3 weight naming policy" {
     const layer_name = try layerTensorNameAlloc(testing.allocator, .qwen3, 2, .mlp_down_proj_weight);
     defer testing.allocator.free(layer_name);
     try testing.expectEqualStrings("model.layers.2.mlp.down_proj.weight", layer_name);
+}
+
+test "family exposes qwen3 generation policy" {
+    const testing = std.testing;
+
+    try testing.expect(isEosToken(.qwen3, 151645));
+    try testing.expect(isEosToken(.qwen3, 151643));
+    try testing.expect(!isEosToken(.qwen3, 1));
+
+    const stops = defaultStopSequences(.qwen3);
+    try testing.expectEqual(@as(usize, 1), stops.len);
+    try testing.expectEqualStrings("<|im_end|>", stops[0]);
+
+    const merged = try effectiveStopSequencesAlloc(testing.allocator, .qwen3, @constCast(&[_][]const u8{ "</tool_response>", "<|im_end|>" }));
+    defer testing.allocator.free(merged);
+    try testing.expectEqual(@as(usize, 2), merged.len);
+    try testing.expectEqualStrings("<|im_end|>", merged[0]);
+    try testing.expectEqualStrings("</tool_response>", merged[1]);
 }

@@ -22,6 +22,16 @@ pub fn forwardTokenId(
     return try decoder_family.forwardTokenId(allocator, store, cfg, cache, token_id);
 }
 
+pub fn prefillTokenIds(
+    allocator: std.mem.Allocator,
+    store: *const tensor_store.TensorStore,
+    cfg: DecoderConfig,
+    cache: *ModelCache,
+    token_ids: []const usize,
+) ![]f32 {
+    return try decoder_family.prefillTokenIds(allocator, store, cfg, cache, token_ids);
+}
+
 pub fn topKLogitsAlloc(
     allocator: std.mem.Allocator,
     cfg: DecoderConfig,
@@ -33,6 +43,18 @@ pub fn topKLogitsAlloc(
 
 pub fn argMaxLogit(cfg: DecoderConfig, logits: []const f32) !usize {
     return try decoder_family.argMaxLogit(cfg.architecture, logits);
+}
+
+pub fn isEosToken(cfg: DecoderConfig, token_id: usize) bool {
+    return decoder_family.isEosToken(cfg.architecture, token_id);
+}
+
+pub fn effectiveStopSequencesAlloc(
+    allocator: std.mem.Allocator,
+    cfg: DecoderConfig,
+    extra_stop_sequences: [][]const u8,
+) ![][]const u8 {
+    return try decoder_family.effectiveStopSequencesAlloc(allocator, cfg.architecture, extra_stop_sequences);
 }
 
 test "decoder config loads qwen3 architecture" {
