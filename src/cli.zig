@@ -17,6 +17,7 @@ const GenerateOptions = struct {
     system_prompt: ?[]const u8,
     sampling: sampler.SamplingConfig,
     seed: u64,
+    stream_output: bool,
     stop_sequences: [][]const u8,
 
     fn deinit(self: *GenerateOptions, allocator: std.mem.Allocator) void {
@@ -335,6 +336,7 @@ fn printUsage() !void {
         \\  --frequency-penalty <f32>
         \\  --repetition-penalty <f32>
         \\  --stop <text>           (repeatable)
+        \\  --stream
         \\  --load <path>           (chat only)
         \\  --save <path>           (chat only)
         \\
@@ -485,6 +487,7 @@ fn initGenerateOptions(mode: qwen_chat_template.ThinkingMode, max_new_tokens: us
         .system_prompt = null,
         .sampling = defaultSamplingConfig(mode),
         .seed = 0,
+        .stream_output = false,
         .stop_sequences = &.{},
     };
 }
@@ -587,6 +590,10 @@ fn parseGenerateFlags(
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
             try stop_sequences.append(allocator, args[i]);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--stream")) {
+            options.stream_output = true;
             continue;
         }
 
@@ -1037,28 +1044,66 @@ fn buildMessagesPromptAlloc(
     return qwen_chat_template.renderMessagesPromptAlloc(allocator, expanded, thinking_mode);
 }
 
-fn shouldStopOnSequences(
-    allocator: std.mem.Allocator,
-    tokenizer: *qwen_bpe.Tokenizer,
-    generated_ids: []const u32,
-    stop_sequences: [][]const u8,
-) !?[]u8 {
-    if (stop_sequences.len == 0) return null;
+const StopAnalysis = struct {
+    printable_len: usize,
+    stop_hit: bool,
+    response_len: usize,
+};
 
-    const decoded = try tokenizer.decodeAlloc(allocator, generated_ids);
-    errdefer allocator.free(decoded);
+fn analyzeGeneratedText(text: []const u8, stop_sequences: [][]const u8) StopAnalysis {
+    var max_overlap: usize = 0;
 
     for (stop_sequences) |stop_sequence| {
         if (stop_sequence.len == 0) continue;
-        if (std.mem.endsWith(u8, decoded, stop_sequence)) {
-            const trimmed = try allocator.dupe(u8, decoded[0 .. decoded.len - stop_sequence.len]);
-            allocator.free(decoded);
-            return trimmed;
+        if (std.mem.endsWith(u8, text, stop_sequence)) {
+            return .{
+                .printable_len = text.len - stop_sequence.len,
+                .stop_hit = true,
+                .response_len = text.len - stop_sequence.len,
+            };
+        }
+
+        const max_candidate = @min(text.len, stop_sequence.len - 1);
+        var overlap = max_candidate;
+        while (overlap > 0) : (overlap -= 1) {
+            if (std.mem.eql(u8, text[text.len - overlap ..], stop_sequence[0..overlap])) {
+                max_overlap = @max(max_overlap, overlap);
+                break;
+            }
         }
     }
 
-    allocator.free(decoded);
-    return null;
+    return .{
+        .printable_len = text.len - max_overlap,
+        .stop_hit = false,
+        .response_len = text.len,
+    };
+}
+
+fn analyzeAndMaybeStream(
+    allocator: std.mem.Allocator,
+    tokenizer: *qwen_bpe.Tokenizer,
+    generated_ids: []const u32,
+    options: GenerateOptions,
+    stdout: anytype,
+    streamed_len: *usize,
+) !?[]u8 {
+    if (!options.stream_output and options.stop_sequences.len == 0) return null;
+
+    const decoded = tokenizer.decodeAlloc(allocator, generated_ids) catch |err| switch (err) {
+        error.InvalidWtf8 => return null,
+        else => return err,
+    };
+    defer allocator.free(decoded);
+
+    const analysis = analyzeGeneratedText(decoded, options.stop_sequences);
+    if (options.stream_output and analysis.printable_len > streamed_len.*) {
+        try stdout.writeAll(decoded[streamed_len.*..analysis.printable_len]);
+        streamed_len.* = analysis.printable_len;
+    }
+    if (!analysis.stop_hit) return null;
+
+    return try allocator.dupe(u8, decoded[0..analysis.response_len]);
 }
 
 fn generateText(
@@ -1069,18 +1114,22 @@ fn generateText(
 ) !void {
     var runtime = try GeneratorRuntime.init(allocator, model_dir);
     defer runtime.deinit();
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+
+    try stdout.print("Zinfer generate\n", .{});
+    try stdout.print("mode: {s}\n", .{thinkingModeName(options.thinking_mode)});
+    try stdout.print("prompt: {s}\n", .{user_text});
+    try stdout.writeAll("response: ");
 
     const prompt = try buildSingleUserPromptAlloc(allocator, user_text, options.system_prompt, options.thinking_mode);
     defer allocator.free(prompt);
 
     const response = try runtime.generateFromPrompt(prompt, options);
     defer allocator.free(response);
-
-    const stdout = std.fs.File.stdout().deprecatedWriter();
-    try stdout.print("Zinfer generate\n", .{});
-    try stdout.print("mode: {s}\n", .{thinkingModeName(options.thinking_mode)});
-    try stdout.print("prompt: {s}\n", .{user_text});
-    try stdout.print("response: {s}\n", .{response});
+    if (!options.stream_output) {
+        try stdout.print("{s}", .{response});
+    }
+    try stdout.writeAll("\n");
 }
 
 fn generateChatFromFile(
@@ -1091,6 +1140,12 @@ fn generateChatFromFile(
 ) !void {
     var runtime = try GeneratorRuntime.init(allocator, model_dir);
     defer runtime.deinit();
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+
+    try stdout.print("Zinfer generate-chat\n", .{});
+    try stdout.print("mode: {s}\n", .{thinkingModeName(options.thinking_mode)});
+    try stdout.print("messages_path: {s}\n", .{messages_json_path});
+    try stdout.writeAll("response: ");
 
     var messages = try loadChatMessages(allocator, messages_json_path);
     defer messages.deinit();
@@ -1100,12 +1155,10 @@ fn generateChatFromFile(
 
     const response = try runtime.generateFromPrompt(prompt, options);
     defer allocator.free(response);
-
-    const stdout = std.fs.File.stdout().deprecatedWriter();
-    try stdout.print("Zinfer generate-chat\n", .{});
-    try stdout.print("mode: {s}\n", .{thinkingModeName(options.thinking_mode)});
-    try stdout.print("messages_path: {s}\n", .{messages_json_path});
-    try stdout.print("response: {s}\n", .{response});
+    if (!options.stream_output) {
+        try stdout.print("{s}", .{response});
+    }
+    try stdout.writeAll("\n");
 }
 
 fn parseThinkingMode(text: []const u8) !qwen_chat_template.ThinkingMode {
@@ -1263,6 +1316,8 @@ const GeneratorRuntime = struct {
         var history_ids = std.ArrayListUnmanaged(usize).empty;
         defer history_ids.deinit(self.allocator);
         try history_ids.appendSlice(self.allocator, prompt_ids);
+        const stdout = std.fs.File.stdout().deprecatedWriter();
+        var streamed_len: usize = 0;
         var prng = std.Random.DefaultPrng.init(options.seed);
         for (0..options.max_new_tokens) |_| {
             const current_logits = last_logits orelse return error.MissingPromptLogits;
@@ -1275,16 +1330,22 @@ const GeneratorRuntime = struct {
 
             try generated.append(self.allocator, std.math.cast(u32, next_token) orelse return error.TokenIdOutOfRange);
             try history_ids.append(self.allocator, next_token);
+            if (try analyzeAndMaybeStream(self.allocator, &self.tokenizer, generated.items, options, stdout, &streamed_len)) |trimmed| {
+                self.allocator.free(current_logits);
+                last_logits = null;
+                return trimmed;
+            }
+
             const next_logits = try qwen3_model.forwardTokenId(self.allocator, &self.store, cfg, &cache, next_token);
             self.allocator.free(current_logits);
             last_logits = next_logits;
-
-            if (try shouldStopOnSequences(self.allocator, &self.tokenizer, generated.items, options.stop_sequences)) |trimmed| {
-                return trimmed;
-            }
         }
 
-        return self.tokenizer.decodeAlloc(self.allocator, generated.items);
+        const response = try self.tokenizer.decodeAlloc(self.allocator, generated.items);
+        if (options.stream_output and response.len > streamed_len) {
+            try stdout.writeAll(response[streamed_len..]);
+        }
+        return response;
     }
 };
 
@@ -1358,10 +1419,14 @@ fn chatLoop(
         const prompt = try qwen_chat_template.renderMessagesPromptAlloc(allocator, history.items(), options.thinking_mode);
         defer allocator.free(prompt);
 
+        try stdout.writeAll("assistant> ");
         const response = try runtime.generateFromPrompt(prompt, options);
         defer allocator.free(response);
 
-        try stdout.print("assistant> {s}\n", .{response});
+        if (!options.stream_output) {
+            try stdout.print("{s}", .{response});
+        }
+        try stdout.writeAll("\n");
         try history.append(.assistant, qwen_chat_template.assistantHistoryContent(response));
     }
 
@@ -1448,3 +1513,23 @@ const ChatHistory = struct {
         return self.messages.items;
     }
 };
+
+test "analyzeGeneratedText trims full stop sequence" {
+    const testing = std.testing;
+
+    const stops: []const []const u8 = &[_][]const u8{"today?"};
+    const analysis = analyzeGeneratedText("Hello today?", @constCast(stops));
+    try testing.expect(analysis.stop_hit);
+    try testing.expectEqual(@as(usize, 6), analysis.printable_len);
+    try testing.expectEqual(@as(usize, 6), analysis.response_len);
+}
+
+test "analyzeGeneratedText holds back partial stop prefix" {
+    const testing = std.testing;
+
+    const stops: []const []const u8 = &[_][]const u8{"today?"};
+    const analysis = analyzeGeneratedText("Hello to", @constCast(stops));
+    try testing.expect(!analysis.stop_hit);
+    try testing.expectEqual(@as(usize, 6), analysis.printable_len);
+    try testing.expectEqual(@as(usize, 8), analysis.response_len);
+}

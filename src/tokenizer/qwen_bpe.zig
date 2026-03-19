@@ -105,6 +105,7 @@ pub const Tokenizer = struct {
         }
 
         const raw = try bytes.toOwnedSlice(allocator);
+        errdefer allocator.free(raw);
         if (std.unicode.utf8ValidateSlice(raw)) return raw;
 
         const fixed = try std.unicode.wtf8ToUtf8LossyAlloc(allocator, raw);
