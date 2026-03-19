@@ -1,62 +1,12 @@
 const std = @import("std");
-const decoder_runtime = @import("decoder_runtime.zig");
-const qwen_bpe = @import("../tokenizer/qwen_bpe.zig");
+const decoder_family = @import("decoder_family.zig");
 
-pub const Tokenizer = union(decoder_runtime.Architecture) {
-    qwen3: qwen_bpe.Tokenizer,
-
-    pub fn loadFromModelDir(
-        backing_allocator: std.mem.Allocator,
-        architecture: decoder_runtime.Architecture,
-        model_dir: []const u8,
-    ) !Tokenizer {
-        return try entryForArchitecture(architecture).load_from_model_dir(backing_allocator, model_dir);
-    }
-
-    pub fn deinit(self: *Tokenizer) void {
-        switch (self.*) {
-            inline else => |*tokenizer| tokenizer.deinit(),
-        }
-    }
-
-    pub fn encodeAlloc(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
-        return switch (self.*) {
-            inline else => |*tokenizer| tokenizer.encodeAlloc(allocator, text),
-        };
-    }
-
-    pub fn decodeAlloc(self: *const Tokenizer, allocator: std.mem.Allocator, ids: []const u32) ![]u8 {
-        return switch (self.*) {
-            inline else => |*tokenizer| tokenizer.decodeAlloc(allocator, ids),
-        };
-    }
-};
-
-const RegistryEntry = struct {
-    load_from_model_dir: *const fn (std.mem.Allocator, []const u8) anyerror!Tokenizer,
-};
-
-fn entryForArchitecture(architecture: decoder_runtime.Architecture) RegistryEntry {
-    return switch (architecture) {
-        .qwen3 => .{
-            .load_from_model_dir = loadQwen3TokenizerFromModelDir,
-        },
-    };
-}
-
-fn loadQwen3TokenizerFromModelDir(
-    backing_allocator: std.mem.Allocator,
-    model_dir: []const u8,
-) !Tokenizer {
-    return .{
-        .qwen3 = try qwen_bpe.Tokenizer.loadFromModelDir(backing_allocator, model_dir),
-    };
-}
+pub const Tokenizer = decoder_family.Tokenizer;
 
 test "decoder tokenizer loads qwen3 and roundtrips prompt text" {
     const testing = std.testing;
 
-    var tokenizer = try Tokenizer.loadFromModelDir(testing.allocator, .qwen3, "models/Qwen3-0.6B");
+    var tokenizer = try decoder_family.loadTokenizerFromModelDir(testing.allocator, .qwen3, "models/Qwen3-0.6B");
     defer tokenizer.deinit();
 
     const ids = try tokenizer.encodeAlloc(testing.allocator, "<|im_start|>user\nHello<|im_end|>\n");

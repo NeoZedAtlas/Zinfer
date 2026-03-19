@@ -2,9 +2,8 @@ const std = @import("std");
 const safetensors = @import("format/safetensors.zig");
 const kv_cache = @import("model/kv_cache.zig");
 const qwen3_block = @import("model/qwen3_block.zig");
+const decoder_family = @import("model/decoder_family.zig");
 const decoder_runtime = @import("model/decoder_runtime.zig");
-const decoder_chat = @import("model/decoder_chat.zig");
-const decoder_tokenizer = @import("model/decoder_tokenizer.zig");
 const tensor_store = @import("tensor/store.zig");
 const sampler = @import("sampling/sampler.zig");
 
@@ -12,7 +11,7 @@ const default_model_dir = "models/Qwen3-0.6B";
 
 const GenerateOptions = struct {
     max_new_tokens: usize,
-    thinking_mode: decoder_chat.ThinkingMode,
+    thinking_mode: decoder_family.ThinkingMode,
     system_prompt: ?[]const u8,
     sampling: sampler.SamplingConfig,
     seed: u64,
@@ -479,7 +478,7 @@ fn parseChatInvocation(
     };
 }
 
-fn initGenerateOptions(mode: decoder_chat.ThinkingMode, max_new_tokens: usize) GenerateOptions {
+fn initGenerateOptions(mode: decoder_family.ThinkingMode, max_new_tokens: usize) GenerateOptions {
     return .{
         .max_new_tokens = max_new_tokens,
         .thinking_mode = mode,
@@ -491,7 +490,7 @@ fn initGenerateOptions(mode: decoder_chat.ThinkingMode, max_new_tokens: usize) G
     };
 }
 
-fn defaultSamplingConfig(mode: decoder_chat.ThinkingMode) sampler.SamplingConfig {
+fn defaultSamplingConfig(mode: decoder_family.ThinkingMode) sampler.SamplingConfig {
     return switch (mode) {
         .enabled => .{
             .temperature = 0.6,
@@ -956,7 +955,7 @@ fn tokenizeText(
     var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
     defer parsed_config.deinit();
 
-    var tokenizer = try decoder_tokenizer.Tokenizer.loadFromModelDir(
+    var tokenizer = try decoder_family.loadTokenizerFromModelDir(
         allocator,
         parsed_config.value.architecture,
         model_dir,
@@ -988,7 +987,7 @@ fn decodeIds(
     var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
     defer parsed_config.deinit();
 
-    var tokenizer = try decoder_tokenizer.Tokenizer.loadFromModelDir(
+    var tokenizer = try decoder_family.loadTokenizerFromModelDir(
         allocator,
         parsed_config.value.architecture,
         model_dir,
@@ -1017,40 +1016,40 @@ fn buildSingleUserPromptAlloc(
     architecture: decoder_runtime.Architecture,
     user_text: []const u8,
     system_prompt: ?[]const u8,
-    thinking_mode: decoder_chat.ThinkingMode,
+    thinking_mode: decoder_family.ThinkingMode,
 ) ![]u8 {
     if (system_prompt) |system| {
-        const messages = [_]decoder_chat.Message{
+        const messages = [_]decoder_family.Message{
             .{ .role = .system, .content = system },
             .{ .role = .user, .content = user_text },
         };
-        return decoder_chat.renderMessagesPromptAlloc(allocator, architecture, &messages, thinking_mode);
+        return decoder_family.renderMessagesPromptAlloc(allocator, architecture, &messages, thinking_mode);
     }
-    return decoder_chat.renderSingleUserPromptAlloc(allocator, architecture, user_text, thinking_mode);
+    return decoder_family.renderSingleUserPromptAlloc(allocator, architecture, user_text, thinking_mode);
 }
 
 fn buildMessagesPromptAlloc(
     allocator: std.mem.Allocator,
     architecture: decoder_runtime.Architecture,
-    messages: []const decoder_chat.Message,
+    messages: []const decoder_family.Message,
     system_prompt: ?[]const u8,
-    thinking_mode: decoder_chat.ThinkingMode,
+    thinking_mode: decoder_family.ThinkingMode,
 ) ![]u8 {
     if (system_prompt == null) {
-        return decoder_chat.renderMessagesPromptAlloc(allocator, architecture, messages, thinking_mode);
+        return decoder_family.renderMessagesPromptAlloc(allocator, architecture, messages, thinking_mode);
     }
 
     const system = system_prompt.?;
     const needs_prepend = messages.len == 0 or messages[0].role != .system;
     if (!needs_prepend) {
-        return decoder_chat.renderMessagesPromptAlloc(allocator, architecture, messages, thinking_mode);
+        return decoder_family.renderMessagesPromptAlloc(allocator, architecture, messages, thinking_mode);
     }
 
-    const expanded = try allocator.alloc(decoder_chat.Message, messages.len + 1);
+    const expanded = try allocator.alloc(decoder_family.Message, messages.len + 1);
     defer allocator.free(expanded);
     expanded[0] = .{ .role = .system, .content = system };
     @memcpy(expanded[1..], messages);
-    return decoder_chat.renderMessagesPromptAlloc(allocator, architecture, expanded, thinking_mode);
+    return decoder_family.renderMessagesPromptAlloc(allocator, architecture, expanded, thinking_mode);
 }
 
 const StopAnalysis = struct {
@@ -1091,7 +1090,7 @@ fn analyzeGeneratedText(text: []const u8, stop_sequences: [][]const u8) StopAnal
 
 fn analyzeAndMaybeStream(
     allocator: std.mem.Allocator,
-    tokenizer: *decoder_tokenizer.Tokenizer,
+    tokenizer: *decoder_family.Tokenizer,
     generated_ids: []const u32,
     options: GenerateOptions,
     stdout: anytype,
@@ -1182,13 +1181,13 @@ fn generateChatFromFile(
     try stdout.writeAll("\n");
 }
 
-fn parseThinkingMode(text: []const u8) !decoder_chat.ThinkingMode {
+fn parseThinkingMode(text: []const u8) !decoder_family.ThinkingMode {
     if (std.mem.eql(u8, text, "think")) return .enabled;
     if (std.mem.eql(u8, text, "no-think")) return .disabled;
     return error.InvalidThinkingMode;
 }
 
-fn thinkingModeName(mode: decoder_chat.ThinkingMode) []const u8 {
+fn thinkingModeName(mode: decoder_family.ThinkingMode) []const u8 {
     return switch (mode) {
         .enabled => "think",
         .disabled => "no-think",
@@ -1201,7 +1200,7 @@ fn isEosToken(token_id: usize) bool {
 
 const LoadedChatMessages = struct {
     arena: std.heap.ArenaAllocator,
-    items: []decoder_chat.Message,
+    items: []decoder_family.Message,
 
     fn deinit(self: *LoadedChatMessages) void {
         self.arena.deinit();
@@ -1231,7 +1230,7 @@ fn loadChatMessages(
     };
     if (messages_value != .array) return error.InvalidMessagesJson;
 
-    const messages = try allocator.alloc(decoder_chat.Message, messages_value.array.items.len);
+    const messages = try allocator.alloc(decoder_family.Message, messages_value.array.items.len);
 
     for (messages_value.array.items, 0..) |item, idx| {
         if (item != .object) return error.InvalidMessagesJson;
@@ -1240,10 +1239,10 @@ fn loadChatMessages(
         const content_value = item.object.get("content") orelse return error.InvalidMessagesJson;
         if (role_value != .string or content_value != .string) return error.InvalidMessagesJson;
 
-        var tool_calls: []const decoder_chat.ToolCall = &.{};
+        var tool_calls: []const decoder_family.ToolCall = &.{};
         if (item.object.get("tool_calls")) |tool_calls_value| {
             if (tool_calls_value != .array) return error.InvalidMessagesJson;
-            const parsed_tool_calls = try allocator.alloc(decoder_chat.ToolCall, tool_calls_value.array.items.len);
+            const parsed_tool_calls = try allocator.alloc(decoder_family.ToolCall, tool_calls_value.array.items.len);
             for (tool_calls_value.array.items, 0..) |tool_call_item, tool_idx| {
                 if (tool_call_item != .object) return error.InvalidMessagesJson;
                 const name_value = tool_call_item.object.get("name") orelse return error.InvalidMessagesJson;
@@ -1283,7 +1282,7 @@ fn readFileAllocAtPath(
     return std.fs.cwd().readFileAlloc(allocator, path, max_bytes);
 }
 
-fn parseChatRole(text: []const u8) !decoder_chat.Role {
+fn parseChatRole(text: []const u8) !decoder_family.Role {
     if (std.mem.eql(u8, text, "system")) return .system;
     if (std.mem.eql(u8, text, "user")) return .user;
     if (std.mem.eql(u8, text, "assistant")) return .assistant;
@@ -1293,7 +1292,7 @@ fn parseChatRole(text: []const u8) !decoder_chat.Role {
 
 const GeneratorRuntime = struct {
     allocator: std.mem.Allocator,
-    tokenizer: decoder_tokenizer.Tokenizer,
+    tokenizer: decoder_family.Tokenizer,
     parsed_config: decoder_runtime.ParsedConfig,
     store: tensor_store.TensorStore,
 
@@ -1306,7 +1305,7 @@ const GeneratorRuntime = struct {
         var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
         errdefer parsed_config.deinit();
 
-        var tokenizer = try decoder_tokenizer.Tokenizer.loadFromModelDir(
+        var tokenizer = try decoder_family.loadTokenizerFromModelDir(
             allocator,
             parsed_config.value.architecture,
             model_dir,
@@ -1464,7 +1463,7 @@ fn chatLoop(
 
         try history.append(.user, line);
 
-        const prompt = try decoder_chat.renderMessagesPromptAlloc(allocator, runtime.parsed_config.value.architecture, history.items(), options.thinking_mode);
+        const prompt = try decoder_family.renderMessagesPromptAlloc(allocator, runtime.parsed_config.value.architecture, history.items(), options.thinking_mode);
         defer allocator.free(prompt);
 
         try stdout.writeAll("assistant> ");
@@ -1475,7 +1474,7 @@ fn chatLoop(
             try stdout.print("{s}", .{response});
         }
         try stdout.writeAll("\n");
-        try history.append(.assistant, decoder_chat.assistantHistoryContent(runtime.parsed_config.value.architecture, response));
+        try history.append(.assistant, decoder_family.assistantHistoryContent(runtime.parsed_config.value.architecture, response));
     }
 
     if (save_path) |path| {
@@ -1485,7 +1484,7 @@ fn chatLoop(
 
 const ChatHistory = struct {
     allocator: std.mem.Allocator,
-    messages: std.ArrayListUnmanaged(decoder_chat.Message),
+    messages: std.ArrayListUnmanaged(decoder_family.Message),
 
     fn init(allocator: std.mem.Allocator) ChatHistory {
         return .{
@@ -1513,20 +1512,20 @@ const ChatHistory = struct {
         self.messages.clearRetainingCapacity();
     }
 
-    fn append(self: *ChatHistory, role: decoder_chat.Role, content: []const u8) !void {
+    fn append(self: *ChatHistory, role: decoder_family.Role, content: []const u8) !void {
         try self.appendMessage(.{
             .role = role,
             .content = content,
         });
     }
 
-    fn appendMessage(self: *ChatHistory, message: decoder_chat.Message) !void {
+    fn appendMessage(self: *ChatHistory, message: decoder_family.Message) !void {
         const owned_content = try self.allocator.dupe(u8, message.content);
         errdefer self.allocator.free(owned_content);
 
-        var owned_tool_calls: []const decoder_chat.ToolCall = &.{};
+        var owned_tool_calls: []const decoder_family.ToolCall = &.{};
         if (message.tool_calls.len != 0) {
-            const copied = try self.allocator.alloc(decoder_chat.ToolCall, message.tool_calls.len);
+            const copied = try self.allocator.alloc(decoder_family.ToolCall, message.tool_calls.len);
             errdefer self.allocator.free(copied);
 
             var copied_len: usize = 0;
@@ -1674,7 +1673,7 @@ const ChatHistory = struct {
         }
     }
 
-    fn items(self: *const ChatHistory) []const decoder_chat.Message {
+    fn items(self: *const ChatHistory) []const decoder_family.Message {
         return self.messages.items;
     }
 };
@@ -1718,10 +1717,10 @@ test "chat history session save and load preserves tool calls" {
     try history.appendMessage(.{
         .role = .assistant,
         .content = "",
-        .tool_calls = &[_]decoder_chat.ToolCall{
-            .{ .name = "lookup_weather", .arguments_json = "{\"city\":\"Shanghai\"}" },
-        },
-    });
+            .tool_calls = &[_]decoder_family.ToolCall{
+                .{ .name = "lookup_weather", .arguments_json = "{\"city\":\"Shanghai\"}" },
+            },
+        });
     try history.append(.tool, "{\"temp\":22}");
 
     const stop_sequences = [_][]const u8{"</tool_response>"};
@@ -1749,9 +1748,9 @@ test "chat history session save and load preserves tool calls" {
     try loaded.loadFromFile(session_path);
 
     try testing.expectEqual(@as(usize, 4), loaded.items().len);
-    try testing.expectEqual(decoder_chat.Role.system, loaded.items()[0].role);
-    try testing.expectEqual(decoder_chat.Role.assistant, loaded.items()[2].role);
-    try testing.expectEqual(decoder_chat.Role.tool, loaded.items()[3].role);
+    try testing.expectEqual(decoder_family.Role.system, loaded.items()[0].role);
+    try testing.expectEqual(decoder_family.Role.assistant, loaded.items()[2].role);
+    try testing.expectEqual(decoder_family.Role.tool, loaded.items()[3].role);
     try testing.expectEqual(@as(usize, 1), loaded.items()[2].tool_calls.len);
     try testing.expectEqualStrings("lookup_weather", loaded.items()[2].tool_calls[0].name);
     try testing.expectEqualStrings("{\"city\":\"Shanghai\"}", loaded.items()[2].tool_calls[0].arguments_json);

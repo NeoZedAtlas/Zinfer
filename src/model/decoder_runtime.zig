@@ -1,17 +1,10 @@
 const std = @import("std");
+const decoder_family = @import("decoder_family.zig");
 const qwen3_config = @import("qwen3_config.zig");
 const qwen3_model = @import("qwen3_model.zig");
 const tensor_store = @import("../tensor/store.zig");
 
-pub const Architecture = enum {
-    qwen3,
-
-    pub fn name(self: Architecture) []const u8 {
-        return switch (self) {
-            .qwen3 => "qwen3",
-        };
-    }
-};
+pub const Architecture = decoder_family.Architecture;
 
 pub const DecoderConfig = struct {
     architecture: Architecture,
@@ -113,7 +106,8 @@ pub fn loadConfigFromFile(backing_allocator: std.mem.Allocator, path: []const u8
     var qwen3 = try qwen3_config.loadFromFile(backing_allocator, path);
     errdefer qwen3.deinit();
 
-    if (!std.mem.eql(u8, qwen3.value.model_type, "qwen3")) return error.UnsupportedModelType;
+    const architecture = decoder_family.detectArchitecture(qwen3.value.model_type) orelse return error.UnsupportedModelType;
+    if (architecture != .qwen3) return error.UnsupportedModelType;
 
     return .{
         .arena = qwen3.arena,

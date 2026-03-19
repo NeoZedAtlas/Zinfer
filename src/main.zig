@@ -17,6 +17,7 @@ test {
     _ = @import("model/qwen3_block.zig");
     _ = @import("model/qwen3_model.zig");
     _ = @import("model/qwen3_attention.zig");
+    _ = @import("model/decoder_family.zig");
     _ = @import("model/decoder_runtime.zig");
     _ = @import("model/decoder_chat.zig");
     _ = @import("model/decoder_tokenizer.zig");
