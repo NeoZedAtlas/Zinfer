@@ -1,11 +1,13 @@
 const std = @import("std");
 const tensor_store = @import("../tensor/store.zig");
+const kv_cache = @import("kv_cache.zig");
+const generic_block = @import("rmsnorm_gqa_swiglu_block.zig");
 const logits_util = @import("logits.zig");
 const weights_layout = @import("weights_layout.zig");
 const adapter_config = @import("adapters/qwen3/config.zig");
 const adapter_generation_policy = @import("adapters/qwen3/generation_policy.zig");
+const adapter_layout = @import("adapters/qwen3/layout.zig");
 const adapter_runtime = @import("adapters/qwen3/runtime.zig");
-const adapter_spec = @import("adapters/qwen3/spec.zig");
 const adapter_tokenizer = @import("adapters/qwen3/tokenizer.zig");
 const adapter_chat_template = @import("adapters/qwen3/chat_template.zig");
 const adapter_weights = @import("adapters/qwen3/weights.zig");
@@ -106,6 +108,7 @@ const Entry = struct {
     load_config_from_file: *const fn (std.mem.Allocator, []const u8) anyerror!ParsedConfig,
     init_model_cache: *const fn (std.mem.Allocator, DecoderConfig, usize) anyerror!ModelCache,
     forward_token_id: *const fn (std.mem.Allocator, *const tensor_store.TensorStore, DecoderConfig, *ModelCache, usize) anyerror![]f32,
+    forward_single_block: *const fn (std.mem.Allocator, *const tensor_store.TensorStore, DecoderConfig, usize, *kv_cache.LayerKVCache, []const f32, []f32) anyerror!void,
     prefill_token_ids: *const fn (std.mem.Allocator, *const tensor_store.TensorStore, DecoderConfig, *ModelCache, []const usize) anyerror![]f32,
     top_k_logits_alloc: *const fn (std.mem.Allocator, []const f32, usize) anyerror![]TopLogit,
     arg_max_logit: *const fn ([]const f32) anyerror!usize,
@@ -157,6 +160,26 @@ pub fn prefillTokenIds(
     token_ids: []const usize,
 ) ![]f32 {
     return try entryForArchitecture(cfg.architecture).prefill_token_ids(allocator, store, cfg, cache, token_ids);
+}
+
+pub fn forwardSingleBlock(
+    allocator: std.mem.Allocator,
+    store: *const tensor_store.TensorStore,
+    cfg: DecoderConfig,
+    layer_index: usize,
+    cache: *kv_cache.LayerKVCache,
+    hidden_in: []const f32,
+    hidden_out: []f32,
+) !void {
+    return try entryForArchitecture(cfg.architecture).forward_single_block(
+        allocator,
+        store,
+        cfg,
+        layer_index,
+        cache,
+        hidden_in,
+        hidden_out,
+    );
 }
 
 pub fn topKLogitsAlloc(
@@ -274,6 +297,7 @@ fn entryForArchitecture(architecture: Architecture) Entry {
             .load_config_from_file = loadQwen3ConfigFromFile,
             .init_model_cache = initQwen3ModelCache,
             .forward_token_id = forwardQwen3TokenId,
+            .forward_single_block = forwardQwen3SingleBlock,
             .prefill_token_ids = prefillQwen3TokenIds,
             .top_k_logits_alloc = adapter_runtime.topKLogitsAlloc,
             .arg_max_logit = adapter_runtime.argMaxLogit,
@@ -396,6 +420,27 @@ fn forwardQwen3TokenId(
     );
 }
 
+fn forwardQwen3SingleBlock(
+    allocator: std.mem.Allocator,
+    store: *const tensor_store.TensorStore,
+    cfg: DecoderConfig,
+    layer_index: usize,
+    cache: *kv_cache.LayerKVCache,
+    hidden_in: []const f32,
+    hidden_out: []f32,
+) !void {
+    return try generic_block.forwardSingleToken(
+        allocator,
+        store,
+        decoderStackConfig(cfg).blockSpec(layer_index),
+        adapter_layout.layer_layout,
+        adapter_weights.layerTensorNameAlloc,
+        cache,
+        hidden_in,
+        hidden_out,
+    );
+}
+
 fn prefillQwen3TokenIds(
     allocator: std.mem.Allocator,
     store: *const tensor_store.TensorStore,
@@ -415,6 +460,20 @@ fn prefillQwen3TokenIds(
     }
 
     return last_logits orelse return error.MissingPromptLogits;
+}
+
+fn decoderStackConfig(cfg: DecoderConfig) @import("decoder_only_stack.zig").Config {
+    return .{
+        .hidden_size = cfg.hidden_size,
+        .intermediate_size = cfg.intermediate_size,
+        .num_hidden_layers = cfg.num_hidden_layers,
+        .num_attention_heads = cfg.num_attention_heads,
+        .num_key_value_heads = cfg.num_key_value_heads,
+        .head_dim = cfg.head_dim,
+        .vocab_size = cfg.vocab_size,
+        .rope_theta = cfg.rope_theta,
+        .rms_norm_eps = cfg.rms_norm_eps,
+    };
 }
 
 fn loadQwen3TokenizerFromModelDir(

@@ -1,10 +1,9 @@
 const std = @import("std");
-const cpu = @import("../../../kernel/cpu.zig");
 const decoder_cache = @import("../../decoder_cache.zig");
+const decoder_only_stack = @import("../../decoder_only_stack.zig");
 const logits_util = @import("../../logits.zig");
-const adapter_block = @import("block.zig");
 const adapter_config = @import("config.zig");
-const adapter_spec = @import("spec.zig");
+const adapter_layout = @import("layout.zig");
 const adapter_weights = @import("weights.zig");
 const tensor_store = @import("../../../tensor/store.zig");
 
@@ -18,32 +17,16 @@ pub fn forwardTokenId(
     cache: *ModelCache,
     token_id: usize,
 ) ![]f32 {
-    if (token_id >= cfg.vocab_size) return error.TokenIdOutOfBounds;
-    if (cache.layers.len != cfg.num_hidden_layers) return error.CacheLayerMismatch;
-
-    var hidden = try store.readRowAsF32Alloc(adapter_weights.common_weights.embed_tokens_weight, token_id);
-    defer allocator.free(hidden);
-
-    var scratch = try allocator.alloc(f32, cfg.hidden_size);
-    defer allocator.free(scratch);
-
-    for (0..cfg.num_hidden_layers) |layer_index| {
-        const spec = adapter_spec.blockSpecFromConfig(cfg, layer_index);
-        try adapter_block.forwardSingleToken(allocator, store, spec, &cache.layers[layer_index], hidden, scratch);
-        std.mem.swap([]f32, &hidden, &scratch);
-    }
-
-    const final_norm_weight = try store.readElementsAsF32Alloc(adapter_weights.common_weights.final_norm_weight, 0, cfg.hidden_size);
-    defer allocator.free(final_norm_weight);
-
-    const final_hidden = try allocator.alloc(f32, cfg.hidden_size);
-    defer allocator.free(final_hidden);
-    try cpu.rmsNorm(final_hidden, hidden, final_norm_weight, @floatCast(cfg.rms_norm_eps));
-
-    const logits = try allocator.alloc(f32, cfg.vocab_size);
-    errdefer allocator.free(logits);
-    try store.matmulVecByName(logits, adapter_weights.common_weights.lm_head_weight, final_hidden);
-    return logits;
+    return try decoder_only_stack.forwardTokenId(
+        allocator,
+        store,
+        stackConfigFromAdapter(cfg),
+        adapter_weights.common_weights,
+        adapter_layout.layer_layout,
+        adapter_weights.layerTensorNameAlloc,
+        cache,
+        token_id,
+    );
 }
 
 pub fn topKLogitsAlloc(
@@ -56,4 +39,18 @@ pub fn topKLogitsAlloc(
 
 pub fn argMaxLogit(values: []const f32) !usize {
     return try logits_util.argMaxLogit(values);
+}
+
+fn stackConfigFromAdapter(cfg: adapter_config.Config) decoder_only_stack.Config {
+    return .{
+        .hidden_size = cfg.hidden_size,
+        .intermediate_size = cfg.intermediate_size,
+        .num_hidden_layers = cfg.num_hidden_layers,
+        .num_attention_heads = cfg.num_attention_heads,
+        .num_key_value_heads = cfg.num_key_value_heads,
+        .head_dim = cfg.head_dim,
+        .vocab_size = cfg.vocab_size,
+        .rope_theta = cfg.rope_theta,
+        .rms_norm_eps = cfg.rms_norm_eps,
+    };
 }
