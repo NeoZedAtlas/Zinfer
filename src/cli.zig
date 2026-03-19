@@ -4,8 +4,8 @@ const kv_cache = @import("model/kv_cache.zig");
 const qwen3_block = @import("model/qwen3_block.zig");
 const decoder_runtime = @import("model/decoder_runtime.zig");
 const decoder_chat = @import("model/decoder_chat.zig");
+const decoder_tokenizer = @import("model/decoder_tokenizer.zig");
 const tensor_store = @import("tensor/store.zig");
-const qwen_bpe = @import("tokenizer/qwen_bpe.zig");
 const sampler = @import("sampling/sampler.zig");
 
 const default_model_dir = "models/Qwen3-0.6B";
@@ -950,7 +950,17 @@ fn tokenizeText(
     model_dir: []const u8,
     text: []const u8,
 ) !void {
-    var tokenizer = try qwen_bpe.Tokenizer.loadFromModelDir(allocator, model_dir);
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+    defer allocator.free(config_path);
+
+    var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
+    defer parsed_config.deinit();
+
+    var tokenizer = try decoder_tokenizer.Tokenizer.loadFromModelDir(
+        allocator,
+        parsed_config.value.architecture,
+        model_dir,
+    );
     defer tokenizer.deinit();
 
     const ids = try tokenizer.encodeAlloc(allocator, text);
@@ -972,7 +982,17 @@ fn decodeIds(
     model_dir: []const u8,
     ids_csv: []const u8,
 ) !void {
-    var tokenizer = try qwen_bpe.Tokenizer.loadFromModelDir(allocator, model_dir);
+    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+    defer allocator.free(config_path);
+
+    var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
+    defer parsed_config.deinit();
+
+    var tokenizer = try decoder_tokenizer.Tokenizer.loadFromModelDir(
+        allocator,
+        parsed_config.value.architecture,
+        model_dir,
+    );
     defer tokenizer.deinit();
 
     const ids_usize = try parseTokenIdsAlloc(allocator, ids_csv);
@@ -1071,7 +1091,7 @@ fn analyzeGeneratedText(text: []const u8, stop_sequences: [][]const u8) StopAnal
 
 fn analyzeAndMaybeStream(
     allocator: std.mem.Allocator,
-    tokenizer: *qwen_bpe.Tokenizer,
+    tokenizer: *decoder_tokenizer.Tokenizer,
     generated_ids: []const u32,
     options: GenerateOptions,
     stdout: anytype,
@@ -1273,7 +1293,7 @@ fn parseChatRole(text: []const u8) !decoder_chat.Role {
 
 const GeneratorRuntime = struct {
     allocator: std.mem.Allocator,
-    tokenizer: qwen_bpe.Tokenizer,
+    tokenizer: decoder_tokenizer.Tokenizer,
     parsed_config: decoder_runtime.ParsedConfig,
     store: tensor_store.TensorStore,
 
@@ -1283,11 +1303,15 @@ const GeneratorRuntime = struct {
         const weights_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
         defer allocator.free(weights_path);
 
-        var tokenizer = try qwen_bpe.Tokenizer.loadFromModelDir(allocator, model_dir);
-        errdefer tokenizer.deinit();
-
         var parsed_config = try decoder_runtime.loadConfigFromFile(allocator, config_path);
         errdefer parsed_config.deinit();
+
+        var tokenizer = try decoder_tokenizer.Tokenizer.loadFromModelDir(
+            allocator,
+            parsed_config.value.architecture,
+            model_dir,
+        );
+        errdefer tokenizer.deinit();
 
         var store = try tensor_store.TensorStore.open(allocator, weights_path);
         errdefer store.deinit();
