@@ -160,6 +160,25 @@ pub fn run(allocator: std.mem.Allocator) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "bench-ops")) {
+        var model_dir: []const u8 = default_model_dir;
+        var iterations: usize = 0;
+
+        if (args.len >= 3) {
+            if (std.fmt.parseInt(usize, args[2], 10)) |parsed_iterations| {
+                iterations = parsed_iterations;
+            } else |_| {
+                model_dir = args[2];
+                if (args.len >= 4) {
+                    iterations = try std.fmt.parseInt(usize, args[3], 10);
+                }
+            }
+        }
+
+        try cli_tools.benchHandwrittenOps(allocator, model_dir, iterations);
+        return;
+    }
+
     if (std.mem.eql(u8, command, "quantize")) {
         if (args.len == 3) {
             try cli_tools.quantizeModelDir(allocator, default_model_dir, args[2]);

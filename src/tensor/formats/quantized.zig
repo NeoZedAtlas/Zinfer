@@ -613,7 +613,7 @@ fn jsonNonNegativeInt(value: std.json.Value) !u64 {
     };
 }
 
-fn encodeQ8Row(output: []u8, values: []const f32) void {
+pub fn encodeQ8Row(output: []u8, values: []const f32) void {
     var max_abs: f32 = 0.0;
     for (values) |value| max_abs = @max(max_abs, @abs(value));
     const scale: f32 = if (max_abs == 0.0) 1.0 else max_abs / 127.0;
@@ -625,7 +625,7 @@ fn encodeQ8Row(output: []u8, values: []const f32) void {
     }
 }
 
-fn encodeQ6Row(output: []u8, values: []const f32) void {
+pub fn encodeQ6Row(output: []u8, values: []const f32) void {
     @memset(output[4..], 0);
     var max_abs: f32 = 0.0;
     for (values) |value| max_abs = @max(max_abs, @abs(value));
@@ -642,7 +642,7 @@ fn encodeQ6Row(output: []u8, values: []const f32) void {
     }
 }
 
-fn encodeQ4Row(output: []u8, values: []const f32) void {
+pub fn encodeQ4Row(output: []u8, values: []const f32) void {
     var max_abs: f32 = 0.0;
     for (values) |value| max_abs = @max(max_abs, @abs(value));
     const scale: f32 = if (max_abs == 0.0) 1.0 else max_abs / 7.0;
@@ -734,7 +734,7 @@ fn decodeQ4Row(bytes: []const u8, row_offset: u64, output: []f32) void {
     }
 }
 
-fn dotQ6Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
+pub fn dotQ6Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     const start = @as(usize, @intCast(row_offset));
     const scale_bits = std.mem.readInt(u32, bytes[start .. start + 4][0..4], .little);
     const scale: f32 = @bitCast(scale_bits);
@@ -857,7 +857,7 @@ fn dotF32Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     return sum;
 }
 
-fn dotQ8Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
+pub fn dotQ8Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     const start = @as(usize, @intCast(row_offset));
     const scale_bits = std.mem.readInt(u32, bytes[start .. start + 4][0..4], .little);
     const scale: f32 = @bitCast(scale_bits);
@@ -880,7 +880,7 @@ fn dotQ8Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     return sum * scale;
 }
 
-fn dotQ4Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
+pub fn dotQ4Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     const start = @as(usize, @intCast(row_offset));
     const scale_bits = std.mem.readInt(u32, bytes[start .. start + 4][0..4], .little);
     const scale: f32 = @bitCast(scale_bits);

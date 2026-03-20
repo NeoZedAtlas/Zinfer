@@ -360,7 +360,7 @@ fn shouldParallelize(rows: usize, cols: usize, thread_count: usize, has_parallel
     return work >= 1_000_000;
 }
 
-fn dotF32Row(row: []const u8, input: []const f32) f32 {
+pub fn dotF32Row(row: []const u8, input: []const f32) f32 {
     var sum: f32 = 0.0;
     var index: usize = 0;
     while (index + 16 <= input.len) : (index += 16) {
@@ -384,7 +384,7 @@ fn dotF32Row(row: []const u8, input: []const f32) f32 {
     return sum;
 }
 
-fn dotBf16Row(row: []const u8, input: []const f32) f32 {
+pub fn dotBf16Row(row: []const u8, input: []const f32) f32 {
     var sum: f32 = 0.0;
     var index: usize = 0;
     while (index + 16 <= input.len) : (index += 16) {

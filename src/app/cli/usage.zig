@@ -19,6 +19,8 @@ pub fn printUsage() !void {
         \\  zinfer generate-token-ids [model_dir] <seed_ids_csv> <steps>
         \\  zinfer bench <text> [max_new_tokens]
         \\  zinfer bench [model_dir] <text> <max_new_tokens>
+        \\  zinfer bench-ops [iterations]
+        \\  zinfer bench-ops [model_dir] [iterations]
         \\  zinfer quantize <q8|q6|q4>
         \\  zinfer quantize <q8|q6|q4> [model_dir]
         \\  zinfer tokenize <text>

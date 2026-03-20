@@ -2,7 +2,7 @@ const std = @import("std");
 const bfloat16 = @import("../../tensor/formats/bfloat16.zig");
 const cpu = @import("../core/cpu.zig");
 
-const q8_cache_group_size: usize = 16;
+pub const q8_cache_group_size: usize = 16;
 
 pub const RoPETable = struct {
     allocator: std.mem.Allocator,
@@ -341,7 +341,7 @@ pub fn scaledDotProductAttentionSingleQueryQ8Cache(
     }
 }
 
-fn dotQ8GroupedSlice(lhs: []const f32, rhs_q8: []const i8, scales: []const u16) f32 {
+pub fn dotQ8GroupedSlice(lhs: []const f32, rhs_q8: []const i8, scales: []const u16) f32 {
     std.debug.assert(lhs.len == rhs_q8.len);
     if (lhs.len == scales.len * q8_cache_group_size) {
         return dotQ8GroupedSliceExact(lhs, rhs_q8, scales);
@@ -371,7 +371,7 @@ fn dotQ8GroupedSlice(lhs: []const f32, rhs_q8: []const i8, scales: []const u16) 
     return sum;
 }
 
-fn axpyQ8GroupedSliceInPlace(output: []f32, alpha: f32, input_q8: []const i8, scales: []const u16) void {
+pub fn axpyQ8GroupedSliceInPlace(output: []f32, alpha: f32, input_q8: []const i8, scales: []const u16) void {
     std.debug.assert(output.len == input_q8.len);
     if (output.len == scales.len * q8_cache_group_size) {
         axpyQ8GroupedSliceExactInPlace(output, alpha, input_q8, scales);
