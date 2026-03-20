@@ -3,7 +3,7 @@ const cpu = @import("../kernel/cpu.zig");
 const decoder_family = @import("decoder_family.zig");
 const generic_block = @import("rmsnorm_gqa_swiglu_block.zig");
 const gqa_attention = @import("gqa_attention.zig");
-const kv_cache = @import("kv_cache.zig");
+const optimized_kv_cache = @import("optimized_kv_cache.zig");
 const tensor_backend = @import("../tensor/backend.zig");
 const parallel_rows = @import("../tensor/parallel_rows.zig");
 const weights_layout = @import("weights_layout.zig");
@@ -91,7 +91,7 @@ pub const Runtime = struct {
     pub fn forwardTokenId(
         self: *Runtime,
         workspace: *Workspace,
-        cache: *decoder_family.ModelCache,
+        cache: *optimized_kv_cache.ModelCache,
         token_id: usize,
     ) ![]f32 {
         if (token_id >= self.cfg.vocab_size) return error.TokenIdOutOfBounds;
@@ -136,7 +136,7 @@ pub const Runtime = struct {
     pub fn prefillTokenIds(
         self: *Runtime,
         workspace: *Workspace,
-        cache: *decoder_family.ModelCache,
+        cache: *optimized_kv_cache.ModelCache,
         token_ids: []const usize,
     ) ![]f32 {
         if (token_ids.len == 0) return error.EmptyPrompt;
@@ -250,7 +250,7 @@ const LayerWeights = struct {
         self: *const LayerWeights,
         runtime: *Runtime,
         workspace: *Workspace,
-        cache: *kv_cache.LayerKVCache,
+        cache: *optimized_kv_cache.LayerKVCache,
         hidden_in: []const f32,
         hidden_out: []f32,
     ) !void {
@@ -276,7 +276,7 @@ const LayerWeights = struct {
         try gqa_attention.applyRoPEToProjectedHeadsInPlace(self.spec.attentionSpec(), workspace.q_normed, workspace.k_normed, position);
         try cache.append(workspace.k_normed, workspace.v_proj);
 
-        try gqa_attention.forwardProjectedSingleToken(
+        try gqa_attention.forwardProjectedSingleTokenBf16Cache(
             self.spec.attentionSpec(),
             workspace.attn_flat,
             workspace.q_normed,

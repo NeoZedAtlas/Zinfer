@@ -1,6 +1,7 @@
 const std = @import("std");
 const safetensors = @import("format/safetensors.zig");
 const kv_cache = @import("model/kv_cache.zig");
+const optimized_kv_cache = @import("model/optimized_kv_cache.zig");
 const decoder_family = @import("model/decoder_family.zig");
 const optimized_decoder = @import("model/optimized_decoder.zig");
 const tensor_backend = @import("tensor/backend.zig");
@@ -1065,7 +1066,7 @@ fn benchPrompt(
         prompt_ids[idx] = token_id;
     }
 
-    var cache = try decoder_family.ModelCache.init(
+    var cache = try optimized_kv_cache.ModelCache.init(
         allocator,
         cfg.num_hidden_layers,
         prompt_ids.len + options.max_new_tokens,
@@ -1095,7 +1096,7 @@ fn benchPrompt(
     const decode_ns = decode_timer.read();
 
     const weights_size = try weightArtifactSize(allocator, model_dir, runtime.model.backendName());
-    const kv_cache_bytes = estimateKvCacheBytes(cfg, prompt_ids.len + options.max_new_tokens);
+    const kv_cache_bytes = estimateKvCacheBytes(cfg, prompt_ids.len + options.max_new_tokens, true);
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("Zinfer benchmark\n", .{});
     try stdout.print("model_dir: {s}\n", .{model_dir});
@@ -1186,7 +1187,16 @@ fn weightArtifactSize(allocator: std.mem.Allocator, model_dir: []const u8, backe
     return fileSizeAtPath(path);
 }
 
-fn estimateKvCacheBytes(cfg: decoder_family.DecoderConfig, max_seq_len: usize) u64 {
+fn estimateKvCacheBytes(cfg: decoder_family.DecoderConfig, max_seq_len: usize, use_optimized_bf16_cache: bool) u64 {
+    if (use_optimized_bf16_cache) {
+        return optimized_kv_cache.estimateBytes(
+            cfg.num_hidden_layers,
+            max_seq_len,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        );
+    }
+
     const total = @as(u128, cfg.num_hidden_layers) *
         @as(u128, max_seq_len) *
         @as(u128, cfg.num_key_value_heads) *
@@ -1610,7 +1620,7 @@ const GeneratorRuntime = struct {
         }
 
         const cfg = self.model.cfg;
-        var cache = try decoder_family.ModelCache.init(
+        var cache = try optimized_kv_cache.ModelCache.init(
             self.allocator,
             cfg.num_hidden_layers,
             prompt_ids.len + options.max_new_tokens,

@@ -75,6 +75,29 @@ pub fn forwardProjectedSingleToken(
     );
 }
 
+pub fn forwardProjectedSingleTokenBf16Cache(
+    spec: AttentionSpec,
+    output: []f32,
+    projected_query: []const f32,
+    key_cache: []const u16,
+    value_cache: []const u16,
+    seq_len: usize,
+    scores_scratch: []f32,
+) !void {
+    try spec.validate();
+    try attention.scaledDotProductAttentionSingleQueryBf16Cache(
+        output,
+        projected_query,
+        key_cache,
+        value_cache,
+        seq_len,
+        spec.num_attention_heads,
+        spec.num_key_value_heads,
+        spec.head_dim,
+        scores_scratch,
+    );
+}
+
 test "gqa attention spec validates grouping and dimensions" {
     const testing = std.testing;
 
