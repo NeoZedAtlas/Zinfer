@@ -344,8 +344,8 @@ fn printUsage() !void {
         \\  zinfer generate-token-ids [model_dir] <seed_ids_csv> <steps>
         \\  zinfer bench <text> [max_new_tokens]
         \\  zinfer bench [model_dir] <text> <max_new_tokens>
-        \\  zinfer quantize <q8|q4>
-        \\  zinfer quantize <q8|q4> [model_dir]
+        \\  zinfer quantize <q8|q6|q4>
+        \\  zinfer quantize <q8|q6|q4> [model_dir]
         \\  zinfer tokenize <text>
         \\  zinfer tokenize [model_dir] <text>
         \\  zinfer decode-ids <ids_csv>
@@ -373,7 +373,7 @@ fn printUsage() !void {
         \\  --frequency-penalty <f32>
         \\  --repetition-penalty <f32>
         \\  --stop <text>           (repeatable)
-        \\  --backend <auto|bf16|q8|q4>
+        \\  --backend <auto|bf16|q8|q6|q4>
         \\  --kv-cache <auto|bf16|q8>
         \\  --threads <usize>       (0 = auto)
         \\  --stream
@@ -711,6 +711,7 @@ fn parseGenerateFlags(
 fn parseBackendScheme(text: []const u8) !tensor_backend.Scheme {
     if (std.mem.eql(u8, text, "auto")) return .auto;
     if (std.mem.eql(u8, text, "bf16")) return .bf16;
+    if (std.mem.eql(u8, text, "q6")) return .q6;
     if (std.mem.eql(u8, text, "q8")) return .q8;
     if (std.mem.eql(u8, text, "q4")) return .q4;
     return error.InvalidBackendScheme;
@@ -1141,6 +1142,8 @@ fn quantizeModelDir(
 ) !void {
     const scheme: quantized.Scheme = if (std.mem.eql(u8, scheme_text, "q8"))
         .q8
+    else if (std.mem.eql(u8, scheme_text, "q6"))
+        .q6
     else if (std.mem.eql(u8, scheme_text, "q4"))
         .q4
     else

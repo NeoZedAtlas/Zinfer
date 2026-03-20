@@ -4,11 +4,13 @@ const parallel_rows = @import("parallel_rows.zig");
 const tensor_store = @import("store.zig");
 
 pub const Scheme = enum {
+    q6,
     q8,
     q4,
 
     pub fn name(self: Scheme) []const u8 {
         return switch (self) {
+            .q6 => "Q6_0",
             .q8 => "Q8_0",
             .q4 => "Q4_0",
         };
@@ -16,6 +18,7 @@ pub const Scheme = enum {
 
     pub fn fileName(self: Scheme) []const u8 {
         return switch (self) {
+            .q6 => "model.q6.zinfer",
             .q8 => "model.q8.zinfer",
             .q4 => "model.q4.zinfer",
         };
@@ -24,11 +27,13 @@ pub const Scheme = enum {
 
 pub const Encoding = enum {
     f32,
+    q6_0,
     q8_0,
     q4_0,
 
     pub fn fromString(text: []const u8) !Encoding {
         if (std.mem.eql(u8, text, "F32")) return .f32;
+        if (std.mem.eql(u8, text, "Q6_0")) return .q6_0;
         if (std.mem.eql(u8, text, "Q8_0")) return .q8_0;
         if (std.mem.eql(u8, text, "Q4_0")) return .q4_0;
         return error.UnsupportedEncoding;
@@ -37,6 +42,7 @@ pub const Encoding = enum {
     pub fn name(self: Encoding) []const u8 {
         return switch (self) {
             .f32 => "F32",
+            .q6_0 => "Q6_0",
             .q8_0 => "Q8_0",
             .q4_0 => "Q4_0",
         };
@@ -163,6 +169,7 @@ pub const Store = struct {
                     value.* = @bitCast(raw);
                 }
             },
+            .q6_0 => decodeQ6Row(self.bytes, row_offset, output),
             .q8_0 => decodeQ8Row(self.bytes, row_offset, output),
             .q4_0 => decodeQ4Row(self.bytes, row_offset, output),
         }
@@ -272,6 +279,7 @@ pub const Store = struct {
             const row_offset = tensor.absolute_offset + @as(u64, row_idx) * tensor.row_bytes;
             output[row_idx] = switch (tensor.encoding) {
                 .f32 => dotF32Row(self.bytes, row_offset, input),
+                .q6_0 => dotQ6Row(self.bytes, row_offset, input),
                 .q8_0 => dotQ8Row(self.bytes, row_offset, input),
                 .q4_0 => dotQ4Row(self.bytes, row_offset, input),
             };
@@ -357,6 +365,7 @@ pub fn quantizeModel(
 
         const row_bytes: u64 = switch (encoding) {
             .f32 => 0,
+            .q6_0 => 4 + (std.math.divCeil(u64, item.info.shape[1] * 6, 8) catch return error.InvalidShape),
             .q8_0 => 4 + item.info.shape[1],
             .q4_0 => 4 + (std.math.divCeil(u64, item.info.shape[1], 2) catch return error.InvalidShape),
         };
@@ -387,6 +396,7 @@ pub fn quantizeModel(
             for (0..rows) |row_index| {
                 try store.readRowAsF32Into(item.name, row_index, row_values, row_scratch);
                 switch (encoding) {
+                    .q6_0 => encodeQ6Row(encoded_row, row_values),
                     .q8_0 => encodeQ8Row(encoded_row, row_values),
                     .q4_0 => encodeQ4Row(encoded_row, row_values),
                     .f32 => unreachable,
@@ -437,6 +447,7 @@ pub fn quantizeModel(
 fn selectEncoding(name: []const u8, info: safetensors.TensorInfo, scheme: Scheme) Encoding {
     if (info.rank() != 2) return .f32;
     return switch (scheme) {
+        .q6 => .q6_0,
         .q8 => .q8_0,
         .q4 => if (shouldKeepQ8InQ4(name)) .q8_0 else .q4_0,
     };
@@ -596,6 +607,23 @@ fn encodeQ8Row(output: []u8, values: []const f32) void {
     }
 }
 
+fn encodeQ6Row(output: []u8, values: []const f32) void {
+    @memset(output[4..], 0);
+    var max_abs: f32 = 0.0;
+    for (values) |value| max_abs = @max(max_abs, @abs(value));
+    const scale: f32 = if (max_abs == 0.0) 1.0 else max_abs / 31.0;
+    std.mem.writeInt(u32, output[0..4], @bitCast(scale), .little);
+    const inv = 1.0 / scale;
+
+    var bit_index: usize = 0;
+    for (values) |value| {
+        const q = std.math.clamp(@as(i32, @intFromFloat(@round(value * inv))), -32, 31);
+        const encoded: u8 = @intCast(q + 32);
+        writePackedBits(output[4..], bit_index, 6, encoded);
+        bit_index += 6;
+    }
+}
+
 fn encodeQ4Row(output: []u8, values: []const f32) void {
     var max_abs: f32 = 0.0;
     for (values) |value| max_abs = @max(max_abs, @abs(value));
@@ -612,6 +640,21 @@ fn encodeQ4Row(output: []u8, values: []const f32) void {
         } else {
             output[byte_index] |= nibble << 4;
         }
+    }
+}
+
+fn decodeQ6Row(bytes: []const u8, row_offset: u64, output: []f32) void {
+    const start = @as(usize, @intCast(row_offset));
+    const scale_bits = std.mem.readInt(u32, bytes[start .. start + 4][0..4], .little);
+    const scale: f32 = @bitCast(scale_bits);
+    const payload = bytes[start + 4 ..];
+
+    var bit_index: usize = 0;
+    for (output) |*value| {
+        const encoded = readPackedBits(payload, bit_index, 6);
+        const q: i32 = @as(i32, encoded) - 32;
+        value.* = @as(f32, @floatFromInt(q)) * scale;
+        bit_index += 6;
     }
 }
 
@@ -635,6 +678,61 @@ fn decodeQ4Row(bytes: []const u8, row_offset: u64, output: []f32) void {
         const q: i8 = @intCast(@as(i16, nibble) - 8);
         value.* = @as(f32, @floatFromInt(q)) * scale;
     }
+}
+
+fn dotQ6Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
+    const start = @as(usize, @intCast(row_offset));
+    const scale_bits = std.mem.readInt(u32, bytes[start .. start + 4][0..4], .little);
+    const scale: f32 = @bitCast(scale_bits);
+    const payload = bytes[start + 4 ..];
+
+    var sum: f32 = 0.0;
+    var bit_index: usize = 0;
+    for (input) |rhs| {
+        const encoded = readPackedBits(payload, bit_index, 6);
+        const q: i32 = @as(i32, encoded) - 32;
+        sum += @as(f32, @floatFromInt(q)) * rhs;
+        bit_index += 6;
+    }
+    return sum * scale;
+}
+
+fn writePackedBits(buffer: []u8, bit_index: usize, bit_width: u8, value: u8) void {
+    var remaining = bit_width;
+    var source: u16 = value;
+    var dst_bit_index = bit_index;
+    while (remaining > 0) {
+        const byte_index = dst_bit_index / 8;
+        const bit_offset: u3 = @intCast(dst_bit_index % 8);
+        const available: u8 = 8 - @as(u8, bit_offset);
+        const chunk_bits: u8 = @min(remaining, available);
+        const mask: u16 = (@as(u16, 1) << @intCast(chunk_bits)) - 1;
+        const chunk: u8 = @intCast(source & mask);
+        buffer[byte_index] |= chunk << bit_offset;
+        source >>= @intCast(chunk_bits);
+        dst_bit_index += chunk_bits;
+        remaining -= chunk_bits;
+    }
+}
+
+fn readPackedBits(buffer: []const u8, bit_index: usize, bit_width: u8) u8 {
+    var remaining = bit_width;
+    var src_bit_index = bit_index;
+    var result: u16 = 0;
+    var result_shift: u8 = 0;
+    while (remaining > 0) {
+        const byte_index = src_bit_index / 8;
+        const bit_offset: u3 = @intCast(src_bit_index % 8);
+        const available: u8 = 8 - @as(u8, bit_offset);
+        const chunk_bits: u8 = @min(remaining, available);
+        const mask: u8 = (@as(u8, 1) << @intCast(chunk_bits)) - 1;
+        const chunk = (buffer[byte_index] >> bit_offset) & mask;
+        result |= @as(u16, chunk) << @intCast(result_shift);
+        src_bit_index += chunk_bits;
+        result_shift += chunk_bits;
+        remaining -= chunk_bits;
+    }
+    return @intCast(result);
 }
 
 fn dotF32Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
@@ -750,6 +848,22 @@ test "quantized q8 row roundtrip and dot" {
     const input = [_]f32{ 1.0, 2.0, -1.0, 0.5 };
     const approx = dotQ8Row(&row, 0, &input);
     try testing.expectApproxEqAbs(@as(f32, -2.0), approx, 0.2);
+}
+
+test "quantized q6 row roundtrip and dot" {
+    const testing = std.testing;
+    const values = [_]f32{ 1.0, -2.0, 0.5, 3.0 };
+    var row: [7]u8 = undefined;
+    encodeQ6Row(&row, &values);
+
+    var decoded = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
+    decodeQ6Row(&row, 0, &decoded);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), decoded[0], 0.2);
+    try testing.expectApproxEqAbs(@as(f32, -2.0), decoded[1], 0.2);
+
+    const input = [_]f32{ 1.0, 2.0, -1.0, 0.5 };
+    const approx = dotQ6Row(&row, 0, &input);
+    try testing.expectApproxEqAbs(@as(f32, -2.0), approx, 0.4);
 }
 
 test "quantized q4 row roundtrip and dot" {

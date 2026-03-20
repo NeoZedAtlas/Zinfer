@@ -7,6 +7,7 @@ const tensor_store = @import("store.zig");
 pub const Scheme = enum {
     auto,
     bf16,
+    q6,
     q8,
     q4,
 
@@ -14,6 +15,7 @@ pub const Scheme = enum {
         return switch (self) {
             .auto => "auto",
             .bf16 => "bf16",
+            .q6 => "q6",
             .q8 => "q8",
             .q4 => "q4",
         };
@@ -23,12 +25,15 @@ pub const Scheme = enum {
 pub const Backend = union(Scheme) {
     auto: void,
     bf16: tensor_store.TensorStore,
+    q6: quantized.Store,
     q8: quantized.Store,
     q4: quantized.Store,
 
     pub fn openFromModelDir(allocator: std.mem.Allocator, model_dir: []const u8, scheme: Scheme) !Backend {
         const q4_path = try std.fs.path.join(allocator, &.{ model_dir, quantized.Scheme.q4.fileName() });
         defer allocator.free(q4_path);
+        const q6_path = try std.fs.path.join(allocator, &.{ model_dir, quantized.Scheme.q6.fileName() });
+        defer allocator.free(q6_path);
         const q8_path = try std.fs.path.join(allocator, &.{ model_dir, quantized.Scheme.q8.fileName() });
         defer allocator.free(q8_path);
         const bf16_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
@@ -36,10 +41,12 @@ pub const Backend = union(Scheme) {
 
         return switch (scheme) {
             .q4 => .{ .q4 = try quantized.Store.open(allocator, q4_path) },
+            .q6 => .{ .q6 = try quantized.Store.open(allocator, q6_path) },
             .q8 => .{ .q8 = try quantized.Store.open(allocator, q8_path) },
             .bf16 => .{ .bf16 = try tensor_store.TensorStore.open(allocator, bf16_path) },
             .auto => blk: {
                 if (pathExists(q4_path)) break :blk .{ .q4 = try quantized.Store.open(allocator, q4_path) };
+                if (pathExists(q6_path)) break :blk .{ .q6 = try quantized.Store.open(allocator, q6_path) };
                 if (pathExists(q8_path)) break :blk .{ .q8 = try quantized.Store.open(allocator, q8_path) };
                 break :blk .{ .bf16 = try tensor_store.TensorStore.open(allocator, bf16_path) };
             },
@@ -50,6 +57,7 @@ pub const Backend = union(Scheme) {
         switch (self.*) {
             .auto => {},
             .bf16 => |*store| store.deinit(),
+            .q6 => |*store| store.deinit(),
             .q8 => |*store| store.deinit(),
             .q4 => |*store| store.deinit(),
         }
@@ -59,6 +67,7 @@ pub const Backend = union(Scheme) {
         return switch (self) {
             .auto => .auto,
             .bf16 => .bf16,
+            .q6 => .q6,
             .q8 => .q8,
             .q4 => .q4,
         };
@@ -68,6 +77,7 @@ pub const Backend = union(Scheme) {
         return switch (self.*) {
             .auto => 0,
             .bf16 => |*store| @intCast(store.bytes.len),
+            .q6 => |*store| @intCast(store.bytes.len),
             .q8 => |*store| @intCast(store.bytes.len),
             .q4 => |*store| @intCast(store.bytes.len),
         };
@@ -75,6 +85,7 @@ pub const Backend = union(Scheme) {
 
     pub const TensorHandle = union(enum) {
         bf16: safetensors.TensorInfo,
+        q6: quantized.TensorInfo,
         q8: quantized.TensorInfo,
         q4: quantized.TensorInfo,
     };
@@ -82,6 +93,7 @@ pub const Backend = union(Scheme) {
     pub fn resolveTensor(self: *const Backend, name: []const u8) !TensorHandle {
         return switch (self.*) {
             .bf16 => |*store| .{ .bf16 = store.getTensor(name) orelse return error.TensorNotFound },
+            .q6 => |*store| .{ .q6 = store.getTensor(name) orelse return error.TensorNotFound },
             .q8 => |*store| .{ .q8 = store.getTensor(name) orelse return error.TensorNotFound },
             .q4 => |*store| .{ .q4 = store.getTensor(name) orelse return error.TensorNotFound },
             .auto => unreachable,
@@ -91,6 +103,7 @@ pub const Backend = union(Scheme) {
     pub fn readVectorInto(self: *const Backend, name: []const u8, output: []f32, scratch: []u8) !void {
         switch (self.*) {
             .bf16 => |*store| try store.readElementsAsF32Into(name, 0, output, scratch),
+            .q6 => |*store| try store.readElementsAsF32Into(name, 0, output),
             .q8 => |*store| try store.readElementsAsF32Into(name, 0, output),
             .q4 => |*store| try store.readElementsAsF32Into(name, 0, output),
             .auto => unreachable,
@@ -100,6 +113,7 @@ pub const Backend = union(Scheme) {
     pub fn readRowInto(self: *const Backend, name: []const u8, row_index: usize, output: []f32, scratch: []u8) !void {
         switch (self.*) {
             .bf16 => |*store| try store.readRowAsF32Into(name, row_index, output, scratch),
+            .q6 => |*store| try store.readRowAsF32Into(name, row_index, output),
             .q8 => |*store| try store.readRowAsF32Into(name, row_index, output),
             .q4 => |*store| try store.readRowAsF32Into(name, row_index, output),
             .auto => unreachable,
@@ -110,6 +124,10 @@ pub const Backend = union(Scheme) {
         switch (tensor) {
             .bf16 => |info| switch (self.*) {
                 .bf16 => |*store| try store.readTensorRowAsF32Into(info, row_index, output),
+                else => return error.BackendTensorMismatch,
+            },
+            .q6 => |info| switch (self.*) {
+                .q6 => |*store| try store.readTensorRowAsF32Into(info, row_index, output),
                 else => return error.BackendTensorMismatch,
             },
             .q8 => |info| switch (self.*) {
@@ -135,6 +153,7 @@ pub const Backend = union(Scheme) {
     ) !void {
         switch (self.*) {
             .bf16 => |*store| try store.matmulVecByNameThreaded(output, name, input, thread_count, pool, scratch),
+            .q6 => |*store| try store.matmulVecByName(output, name, input, thread_count, pool),
             .q8 => |*store| try store.matmulVecByName(output, name, input, thread_count, pool),
             .q4 => |*store| try store.matmulVecByName(output, name, input, thread_count, pool),
             .auto => unreachable,
@@ -153,6 +172,10 @@ pub const Backend = union(Scheme) {
         switch (tensor) {
             .bf16 => |info| switch (self.*) {
                 .bf16 => |*store| try store.matmulVecThreaded(output, info, input, thread_count, pool),
+                else => return error.BackendTensorMismatch,
+            },
+            .q6 => |info| switch (self.*) {
+                .q6 => |*store| try store.matmulVec(output, info, input, thread_count, pool),
                 else => return error.BackendTensorMismatch,
             },
             .q8 => |info| switch (self.*) {
