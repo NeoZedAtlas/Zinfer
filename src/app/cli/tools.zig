@@ -1,12 +1,11 @@
 const std = @import("std");
+const GenerateOptions = @import("args.zig").GenerateOptions;
 const cli_prompts = @import("prompts.zig");
+const cli_runtime = @import("runtime.zig");
 const cli_token_ids = @import("token_ids.zig");
 const optimized_kv_cache = @import("../../model/optimized_kv_cache.zig");
 const decoder_family = @import("../../model/decoder_family.zig");
-const optimized_decoder = @import("../../model/optimized_decoder.zig");
 const quantized = @import("../../tensor/quantized.zig");
-const tensor_backend = @import("../../tensor/backend.zig");
-const GenerateOptions = @import("args.zig").GenerateOptions;
 
 pub fn benchPrompt(
     allocator: std.mem.Allocator,
@@ -14,7 +13,7 @@ pub fn benchPrompt(
     user_text: []const u8,
     options: GenerateOptions,
 ) !void {
-    var runtime = try GeneratorRuntime.init(allocator, model_dir, options.backend_scheme, options.thread_count);
+    var runtime = try cli_runtime.GeneratorRuntime.init(allocator, model_dir, options.backend_scheme, options.thread_count);
     defer runtime.deinit();
     const cfg = runtime.model.cfg;
     const resolved_kv_cache_scheme = optimized_kv_cache.resolveScheme(options.kv_cache_scheme, runtime.model.backendName());
@@ -229,47 +228,3 @@ fn tokensPerSecond(token_count: usize, elapsed_ns: u64) f64 {
     if (token_count == 0 or elapsed_ns == 0) return 0.0;
     return @as(f64, @floatFromInt(token_count)) * 1_000_000_000.0 / @as(f64, @floatFromInt(elapsed_ns));
 }
-
-const GeneratorRuntime = struct {
-    allocator: std.mem.Allocator,
-    tokenizer: decoder_family.Tokenizer,
-    model: optimized_decoder.Runtime,
-
-    fn init(
-        allocator: std.mem.Allocator,
-        model_dir: []const u8,
-        backend_scheme: tensor_backend.Scheme,
-        thread_count: usize,
-    ) !GeneratorRuntime {
-        const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
-        defer allocator.free(config_path);
-        var parsed_config = try decoder_family.loadConfigFromFile(allocator, config_path);
-        defer parsed_config.deinit();
-
-        var tokenizer = try decoder_family.loadTokenizerFromModelDir(
-            allocator,
-            parsed_config.value.architecture,
-            model_dir,
-        );
-        errdefer tokenizer.deinit();
-
-        var model = try optimized_decoder.Runtime.init(
-            allocator,
-            model_dir,
-            backend_scheme,
-            if (thread_count == 0) null else thread_count,
-        );
-        errdefer model.deinit();
-
-        return .{
-            .allocator = allocator,
-            .tokenizer = tokenizer,
-            .model = model,
-        };
-    }
-
-    fn deinit(self: *GeneratorRuntime) void {
-        self.model.deinit();
-        self.tokenizer.deinit();
-    }
-};
