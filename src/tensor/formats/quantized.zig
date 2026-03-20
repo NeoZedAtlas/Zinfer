@@ -1,7 +1,7 @@
 const std = @import("std");
-const safetensors = @import("../format/safetensors.zig");
-const parallel_rows = @import("parallel_rows.zig");
-const tensor_store = @import("store.zig");
+const safetensors = @import("../../format/safetensors.zig");
+const parallel_rows = @import("../parallel/parallel_rows.zig");
+const tensor_store = @import("../storage/store.zig");
 
 pub const Scheme = enum {
     q6,

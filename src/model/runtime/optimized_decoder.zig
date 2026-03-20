@@ -1,12 +1,12 @@
 const std = @import("std");
-const attention = @import("../../kernel/attention.zig");
-const cpu = @import("../../kernel/cpu.zig");
+const attention = @import("../../kernel/attention/attention.zig");
+const cpu = @import("../../kernel/core/cpu.zig");
 const decoder_family = @import("decoder_family.zig");
 const generic_block = @import("../layers/rmsnorm_gqa_swiglu_block.zig");
 const gqa_attention = @import("../layers/gqa_attention.zig");
 const optimized_kv_cache = @import("optimized_kv_cache.zig");
-const tensor_backend = @import("../../tensor/backend.zig");
-const parallel_rows = @import("../../tensor/parallel_rows.zig");
+const tensor_backend = @import("../../tensor/backends/backend.zig");
+const parallel_rows = @import("../../tensor/parallel/parallel_rows.zig");
 const weights_layout = @import("../layers/weights_layout.zig");
 
 pub const Runtime = struct {

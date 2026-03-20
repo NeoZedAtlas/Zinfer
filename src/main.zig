@@ -11,8 +11,8 @@ pub fn main() !void {
 
 test {
     std.testing.refAllDecls(@This());
-    _ = @import("kernel/cpu.zig");
-    _ = @import("kernel/attention.zig");
+    _ = @import("kernel/core/cpu.zig");
+    _ = @import("kernel/attention/attention.zig");
     _ = @import("model/runtime/kv_cache.zig");
     _ = @import("model/runtime/decoder_cache.zig");
     _ = @import("model/layers/decoder_only_stack.zig");
@@ -31,8 +31,8 @@ test {
     _ = @import("model/runtime/optimized_kv_cache.zig");
     _ = @import("model/layers/weights_layout.zig");
     _ = @import("model/families/qwen3/chat_template.zig");
-    _ = @import("tensor/backend.zig");
+    _ = @import("tensor/backends/backend.zig");
     _ = @import("tokenizer/bpe.zig");
-    _ = @import("tensor/quantized.zig");
+    _ = @import("tensor/formats/quantized.zig");
     _ = @import("sampling/sampler.zig");
 }

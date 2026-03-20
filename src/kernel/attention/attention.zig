@@ -1,6 +1,6 @@
 const std = @import("std");
-const bfloat16 = @import("../tensor/bfloat16.zig");
-const cpu = @import("cpu.zig");
+const bfloat16 = @import("../../tensor/formats/bfloat16.zig");
+const cpu = @import("../core/cpu.zig");
 
 const q8_cache_group_size: usize = 16;
 

@@ -3,7 +3,7 @@ const cli_token_ids = @import("token_ids.zig");
 const safetensors = @import("../../format/safetensors.zig");
 const kv_cache = @import("../../model/runtime/kv_cache.zig");
 const decoder_family = @import("../../model/runtime/decoder_family.zig");
-const tensor_store = @import("../../tensor/store.zig");
+const tensor_store = @import("../../tensor/storage/store.zig");
 
 pub fn inspectConfig(allocator: std.mem.Allocator, model_dir: []const u8) !void {
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });

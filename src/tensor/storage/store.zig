@@ -1,7 +1,7 @@
 const std = @import("std");
-const bfloat16 = @import("bfloat16.zig");
-const parallel_rows = @import("parallel_rows.zig");
-const safetensors = @import("../format/safetensors.zig");
+const bfloat16 = @import("../formats/bfloat16.zig");
+const parallel_rows = @import("../parallel/parallel_rows.zig");
+const safetensors = @import("../../format/safetensors.zig");
 
 pub const TensorStore = struct {
     allocator: std.mem.Allocator,

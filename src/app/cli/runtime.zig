@@ -3,7 +3,7 @@ const GenerateOptions = @import("args.zig").GenerateOptions;
 const optimized_kv_cache = @import("../../model/runtime/optimized_kv_cache.zig");
 const decoder_family = @import("../../model/runtime/decoder_family.zig");
 const optimized_decoder = @import("../../model/runtime/optimized_decoder.zig");
-const tensor_backend = @import("../../tensor/backend.zig");
+const tensor_backend = @import("../../tensor/backends/backend.zig");
 const sampler = @import("../../sampling/sampler.zig");
 
 pub const StopAnalysis = struct {
