@@ -649,12 +649,26 @@ fn decodeQ6Row(bytes: []const u8, row_offset: u64, output: []f32) void {
     const scale: f32 = @bitCast(scale_bits);
     const payload = bytes[start + 4 ..];
 
-    var bit_index: usize = 0;
-    for (output) |*value| {
+    var out_index: usize = 0;
+    var payload_index: usize = 0;
+    while (out_index + 4 <= output.len) : ({
+        out_index += 4;
+        payload_index += 3;
+    }) {
+        const packed24 = @as(u32, payload[payload_index]) |
+            (@as(u32, payload[payload_index + 1]) << 8) |
+            (@as(u32, payload[payload_index + 2]) << 16);
+        inline for (0..4) |lane| {
+            const encoded: u8 = @intCast((packed24 >> (lane * 6)) & 0x3F);
+            const q: i32 = @as(i32, encoded) - 32;
+            output[out_index + lane] = @as(f32, @floatFromInt(q)) * scale;
+        }
+    }
+    while (out_index < output.len) : (out_index += 1) {
+        const bit_index = out_index * 6;
         const encoded = readPackedBits(payload, bit_index, 6);
         const q: i32 = @as(i32, encoded) - 32;
-        value.* = @as(f32, @floatFromInt(q)) * scale;
-        bit_index += 6;
+        output[out_index] = @as(f32, @floatFromInt(q)) * scale;
     }
 }
 
@@ -687,12 +701,33 @@ fn dotQ6Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     const payload = bytes[start + 4 ..];
 
     var sum: f32 = 0.0;
-    var bit_index: usize = 0;
-    for (input) |rhs| {
+    var index: usize = 0;
+    var payload_index: usize = 0;
+    while (index + 4 <= input.len) : ({
+        index += 4;
+        payload_index += 3;
+    }) {
+        const packed24 = @as(u32, payload[payload_index]) |
+            (@as(u32, payload[payload_index + 1]) << 8) |
+            (@as(u32, payload[payload_index + 2]) << 16);
+
+        var q_arr: [4]f32 = undefined;
+        var rhs_arr: [4]f32 = undefined;
+        inline for (0..4) |lane| {
+            const encoded: u8 = @intCast((packed24 >> (lane * 6)) & 0x3F);
+            const q: i32 = @as(i32, encoded) - 32;
+            q_arr[lane] = @floatFromInt(q);
+            rhs_arr[lane] = input[index + lane];
+        }
+        const qv: @Vector(4, f32) = q_arr;
+        const rhs: @Vector(4, f32) = rhs_arr;
+        sum += @reduce(.Add, qv * rhs);
+    }
+    while (index < input.len) : (index += 1) {
+        const bit_index = index * 6;
         const encoded = readPackedBits(payload, bit_index, 6);
         const q: i32 = @as(i32, encoded) - 32;
-        sum += @as(f32, @floatFromInt(q)) * rhs;
-        bit_index += 6;
+        sum += @as(f32, @floatFromInt(q)) * input[index];
     }
     return sum * scale;
 }
