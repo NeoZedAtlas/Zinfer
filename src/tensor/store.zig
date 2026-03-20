@@ -64,6 +64,15 @@ pub const TensorStore = struct {
     ) !void {
         _ = scratch;
         const tensor = self.getTensor(name) orelse return error.TensorNotFound;
+        try self.readTensorElementsAsF32Into(tensor, start_element, output);
+    }
+
+    pub fn readTensorElementsAsF32Into(
+        self: *const TensorStore,
+        tensor: safetensors.TensorInfo,
+        start_element: u64,
+        output: []f32,
+    ) !void {
         const total_elements = try tensor.elementCount();
         if (start_element > total_elements) return error.ElementRangeOutOfBounds;
         const requested = @as(u64, output.len);
@@ -103,6 +112,15 @@ pub const TensorStore = struct {
     ) !void {
         _ = scratch;
         const tensor = self.getTensor(name) orelse return error.TensorNotFound;
+        try self.readTensorRowAsF32Into(tensor, row_index, output);
+    }
+
+    pub fn readTensorRowAsF32Into(
+        self: *const TensorStore,
+        tensor: safetensors.TensorInfo,
+        row_index: usize,
+        output: []f32,
+    ) !void {
         if (tensor.rank() != 2) return error.InvalidTensorRank;
 
         const rows = std.math.cast(usize, tensor.shape[0]) orelse return error.DimensionTooLarge;
@@ -111,7 +129,7 @@ pub const TensorStore = struct {
         if (output.len != cols) return error.SizeMismatch;
 
         const start = try std.math.mul(u64, row_index, cols);
-        try self.readElementsAsF32Into(name, start, output, &.{});
+        try self.readTensorElementsAsF32Into(tensor, start, output);
     }
 
     pub fn matmulVecByName(
@@ -144,6 +162,17 @@ pub const TensorStore = struct {
     ) !void {
         _ = scratch;
         const tensor = self.getTensor(name) orelse return error.TensorNotFound;
+        try self.matmulVecThreaded(output, tensor, input, thread_count, pool);
+    }
+
+    pub fn matmulVecThreaded(
+        self: *const TensorStore,
+        output: []f32,
+        tensor: safetensors.TensorInfo,
+        input: []const f32,
+        thread_count: usize,
+        pool: ?*parallel_rows.Pool,
+    ) !void {
         if (tensor.rank() != 2) return error.InvalidTensorRank;
 
         const rows = std.math.cast(usize, tensor.shape[0]) orelse return error.DimensionTooLarge;

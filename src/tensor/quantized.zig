@@ -111,6 +111,15 @@ pub const Store = struct {
         output: []f32,
     ) !void {
         const tensor = self.getTensor(name) orelse return error.TensorNotFound;
+        try self.readTensorElementsAsF32Into(tensor, start_element, output);
+    }
+
+    pub fn readTensorElementsAsF32Into(
+        self: *const Store,
+        tensor: TensorInfo,
+        start_element: u64,
+        output: []f32,
+    ) !void {
         if (tensor.encoding != .f32) return error.UnsupportedEncoding;
         const total_elements = elementCount(tensor.shape);
         if (start_element + output.len > total_elements) return error.ElementRangeOutOfBounds;
@@ -129,6 +138,15 @@ pub const Store = struct {
         output: []f32,
     ) !void {
         const tensor = self.getTensor(name) orelse return error.TensorNotFound;
+        try self.readTensorRowAsF32Into(tensor, row_index, output);
+    }
+
+    pub fn readTensorRowAsF32Into(
+        self: *const Store,
+        tensor: TensorInfo,
+        row_index: usize,
+        output: []f32,
+    ) !void {
         if (tensor.rank() != 2) return error.InvalidTensorRank;
         const rows = std.math.cast(usize, tensor.shape[0]) orelse return error.DimensionTooLarge;
         const cols = std.math.cast(usize, tensor.shape[1]) orelse return error.DimensionTooLarge;
@@ -159,6 +177,17 @@ pub const Store = struct {
         pool: ?*parallel_rows.Pool,
     ) !void {
         const tensor = self.getTensor(name) orelse return error.TensorNotFound;
+        try self.matmulVec(output, tensor, input, thread_count, pool);
+    }
+
+    pub fn matmulVec(
+        self: *const Store,
+        output: []f32,
+        tensor: TensorInfo,
+        input: []const f32,
+        thread_count: usize,
+        pool: ?*parallel_rows.Pool,
+    ) !void {
         if (tensor.rank() != 2) return error.InvalidTensorRank;
 
         const rows = std.math.cast(usize, tensor.shape[0]) orelse return error.DimensionTooLarge;
@@ -324,13 +353,7 @@ pub fn quantizeModel(
     var current_offset: u64 = 0;
     for (sorted) |item| {
         const begin = current_offset;
-        const encoding: Encoding = if (item.info.rank() == 2)
-            switch (scheme) {
-                .q8 => .q8_0,
-                .q4 => .q4_0,
-            }
-        else
-            .f32;
+        const encoding = selectEncoding(item.name, item.info, scheme);
 
         const row_bytes: u64 = switch (encoding) {
             .f32 => 0,
@@ -363,9 +386,10 @@ pub fn quantizeModel(
 
             for (0..rows) |row_index| {
                 try store.readRowAsF32Into(item.name, row_index, row_values, row_scratch);
-                switch (scheme) {
-                    .q8 => encodeQ8Row(encoded_row, row_values),
-                    .q4 => encodeQ4Row(encoded_row, row_values),
+                switch (encoding) {
+                    .q8_0 => encodeQ8Row(encoded_row, row_values),
+                    .q4_0 => encodeQ4Row(encoded_row, row_values),
+                    .f32 => unreachable,
                 }
                 try temp_file.writeAll(encoded_row);
                 current_offset += encoded_row.len;
@@ -408,6 +432,23 @@ pub fn quantizeModel(
     } else {
         try std.fs.cwd().deleteFile(temp_path);
     }
+}
+
+fn selectEncoding(name: []const u8, info: safetensors.TensorInfo, scheme: Scheme) Encoding {
+    if (info.rank() != 2) return .f32;
+    return switch (scheme) {
+        .q8 => .q8_0,
+        .q4 => if (shouldKeepQ8InQ4(name)) .q8_0 else .q4_0,
+    };
+}
+
+fn shouldKeepQ8InQ4(name: []const u8) bool {
+    return std.mem.eql(u8, name, "model.embed_tokens.weight") or
+        std.mem.eql(u8, name, "lm_head.weight") or
+        std.mem.endsWith(u8, name, ".self_attn.q_proj.weight") or
+        std.mem.endsWith(u8, name, ".self_attn.k_proj.weight") or
+        std.mem.endsWith(u8, name, ".self_attn.v_proj.weight") or
+        std.mem.endsWith(u8, name, ".self_attn.o_proj.weight");
 }
 
 fn sortedSourceTensors(allocator: std.mem.Allocator, parsed: *const safetensors.ParsedFile) ![]SourceTensor {
@@ -725,4 +766,28 @@ test "quantized q4 row roundtrip and dot" {
     const input = [_]f32{ 1.0, 2.0, -1.0, 0.5 };
     const approx = dotQ4Row(&row, 0, &input);
     try testing.expectApproxEqAbs(@as(f32, -2.0), approx, 0.8);
+}
+
+test "q4 mixed policy keeps sensitive tensors at q8" {
+    const testing = std.testing;
+
+    const matrix_info = safetensors.TensorInfo{
+        .dtype = .bf16,
+        .shape = &.{ 8, 8 },
+        .data_offsets = .{ 0, 128 },
+        .absolute_offset = 0,
+    };
+
+    try testing.expectEqual(
+        Encoding.q8_0,
+        selectEncoding("model.embed_tokens.weight", matrix_info, .q4),
+    );
+    try testing.expectEqual(
+        Encoding.q8_0,
+        selectEncoding("model.layers.0.self_attn.q_proj.weight", matrix_info, .q4),
+    );
+    try testing.expectEqual(
+        Encoding.q4_0,
+        selectEncoding("model.layers.0.mlp.down_proj.weight", matrix_info, .q4),
+    );
 }

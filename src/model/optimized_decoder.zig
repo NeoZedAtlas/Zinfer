@@ -1,4 +1,5 @@
 const std = @import("std");
+const attention = @import("../kernel/attention.zig");
 const cpu = @import("../kernel/cpu.zig");
 const decoder_family = @import("decoder_family.zig");
 const generic_block = @import("rmsnorm_gqa_swiglu_block.zig");
@@ -14,6 +15,8 @@ pub const Runtime = struct {
     backend: tensor_backend.Backend,
     common_weights: decoder_family.CommonWeights,
     layer_layout: generic_block.LayerLayout,
+    embed_tokens_tensor: tensor_backend.Backend.TensorHandle,
+    lm_head_tensor: tensor_backend.Backend.TensorHandle,
     layers: []LayerWeights,
     final_norm_weight: []f32,
     thread_count: usize,
@@ -43,6 +46,8 @@ pub const Runtime = struct {
         const common_weights = decoder_family.commonWeights(cfg.architecture);
         const layer_layout = decoder_family.layerLayout(cfg.architecture);
         const io_scratch_bytes = maxIoScratchBytes(cfg);
+        const embed_tokens_tensor = try backend.resolveTensor(common_weights.embed_tokens_weight);
+        const lm_head_tensor = try backend.resolveTensor(common_weights.lm_head_weight);
 
         const final_norm_weight = try allocVector(&backend, allocator, common_weights.final_norm_weight, cfg.hidden_size, io_scratch_bytes);
         errdefer allocator.free(final_norm_weight);
@@ -66,6 +71,8 @@ pub const Runtime = struct {
             .backend = backend,
             .common_weights = common_weights,
             .layer_layout = layer_layout,
+            .embed_tokens_tensor = embed_tokens_tensor,
+            .lm_head_tensor = lm_head_tensor,
             .layers = layers,
             .final_norm_weight = final_norm_weight,
             .thread_count = resolved_thread_count,
@@ -95,8 +102,8 @@ pub const Runtime = struct {
         token_id: usize,
     ) ![]f32 {
         if (token_id >= self.cfg.vocab_size) return error.TokenIdOutOfBounds;
-        try self.backend.readRowInto(
-            self.common_weights.embed_tokens_weight,
+        try self.backend.readRowIntoTensor(
+            self.embed_tokens_tensor,
             token_id,
             workspace.hidden_a,
             workspace.io_scratch,
@@ -116,16 +123,16 @@ pub const Runtime = struct {
         }
 
         try cpu.rmsNorm(
-            workspace.final_hidden,
+            workspace.normed,
             hidden_in,
             self.final_norm_weight,
             @floatCast(self.cfg.rms_norm_eps),
         );
 
-        try self.backend.matmulVecByName(
+        try self.backend.matmulVec(
             workspace.logits,
-            self.common_weights.lm_head_weight,
-            workspace.final_hidden,
+            self.lm_head_tensor,
+            workspace.normed,
             self.thread_count,
             &self.parallel_pool,
             workspace.io_scratch,
@@ -151,6 +158,10 @@ pub const Runtime = struct {
     pub fn backendName(self: Runtime) []const u8 {
         return self.backend.resolvedScheme().name();
     }
+
+    pub fn artifactBytes(self: *const Runtime) u64 {
+        return self.backend.artifactBytes();
+    }
 };
 
 const LayerWeights = struct {
@@ -159,13 +170,13 @@ const LayerWeights = struct {
     post_ln_weight: []f32,
     q_norm_weight: ?[]f32,
     k_norm_weight: ?[]f32,
-    q_proj_name: []u8,
-    k_proj_name: []u8,
-    v_proj_name: []u8,
-    o_proj_name: []u8,
-    gate_proj_name: []u8,
-    up_proj_name: []u8,
-    down_proj_name: []u8,
+    q_proj_tensor: tensor_backend.Backend.TensorHandle,
+    k_proj_tensor: tensor_backend.Backend.TensorHandle,
+    v_proj_tensor: tensor_backend.Backend.TensorHandle,
+    o_proj_tensor: tensor_backend.Backend.TensorHandle,
+    gate_proj_tensor: tensor_backend.Backend.TensorHandle,
+    up_proj_tensor: tensor_backend.Backend.TensorHandle,
+    down_proj_tensor: tensor_backend.Backend.TensorHandle,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -222,13 +233,13 @@ const LayerWeights = struct {
             .post_ln_weight = post_ln_weight,
             .q_norm_weight = q_norm_weight,
             .k_norm_weight = k_norm_weight,
-            .q_proj_name = try allocMatrixName(allocator, cfg, layer_index, layout.q_proj_kind),
-            .k_proj_name = try allocMatrixName(allocator, cfg, layer_index, layout.k_proj_kind),
-            .v_proj_name = try allocMatrixName(allocator, cfg, layer_index, layout.v_proj_kind),
-            .o_proj_name = try allocMatrixName(allocator, cfg, layer_index, layout.o_proj_kind),
-            .gate_proj_name = try allocMatrixName(allocator, cfg, layer_index, layout.gate_proj_kind),
-            .up_proj_name = try allocMatrixName(allocator, cfg, layer_index, layout.up_proj_kind),
-            .down_proj_name = try allocMatrixName(allocator, cfg, layer_index, layout.down_proj_kind),
+            .q_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.q_proj_kind),
+            .k_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.k_proj_kind),
+            .v_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.v_proj_kind),
+            .o_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.o_proj_kind),
+            .gate_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.gate_proj_kind),
+            .up_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.up_proj_kind),
+            .down_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.down_proj_kind),
         };
     }
 
@@ -237,13 +248,6 @@ const LayerWeights = struct {
         allocator.free(self.post_ln_weight);
         if (self.q_norm_weight) |buffer| allocator.free(buffer);
         if (self.k_norm_weight) |buffer| allocator.free(buffer);
-        allocator.free(self.q_proj_name);
-        allocator.free(self.k_proj_name);
-        allocator.free(self.v_proj_name);
-        allocator.free(self.o_proj_name);
-        allocator.free(self.gate_proj_name);
-        allocator.free(self.up_proj_name);
-        allocator.free(self.down_proj_name);
     }
 
     fn forward(
@@ -256,31 +260,34 @@ const LayerWeights = struct {
     ) !void {
         try cpu.rmsNorm(workspace.normed, hidden_in, self.input_ln_weight, self.spec.rms_norm_eps);
 
-        try runtime.backend.matmulVecByName(workspace.q_proj, self.q_proj_name, workspace.normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
-        try runtime.backend.matmulVecByName(workspace.k_proj, self.k_proj_name, workspace.normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
-        try runtime.backend.matmulVecByName(workspace.v_proj, self.v_proj_name, workspace.normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
+        try runtime.backend.matmulVec(workspace.q_proj, self.q_proj_tensor, workspace.normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
+        try runtime.backend.matmulVec(workspace.k_proj, self.k_proj_tensor, workspace.normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
+        try runtime.backend.matmulVec(workspace.v_proj, self.v_proj_tensor, workspace.normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
 
         if (self.q_norm_weight) |weight| {
-            try cpu.rmsNormRepeated(workspace.q_normed, workspace.q_proj, self.spec.num_attention_heads, self.spec.head_dim, weight, self.spec.rms_norm_eps);
-        } else {
-            @memcpy(workspace.q_normed, workspace.q_proj);
+            try cpu.rmsNormRepeated(workspace.q_proj, workspace.q_proj, self.spec.num_attention_heads, self.spec.head_dim, weight, self.spec.rms_norm_eps);
         }
 
         if (self.k_norm_weight) |weight| {
-            try cpu.rmsNormRepeated(workspace.k_normed, workspace.k_proj, self.spec.num_key_value_heads, self.spec.head_dim, weight, self.spec.rms_norm_eps);
-        } else {
-            @memcpy(workspace.k_normed, workspace.k_proj);
+            try cpu.rmsNormRepeated(workspace.k_proj, workspace.k_proj, self.spec.num_key_value_heads, self.spec.head_dim, weight, self.spec.rms_norm_eps);
         }
 
         const position = cache.len;
-        try gqa_attention.applyRoPEToProjectedHeadsInPlace(self.spec.attentionSpec(), workspace.q_normed, workspace.k_normed, position);
-        try cache.append(workspace.k_normed, workspace.v_proj);
+        try gqa_attention.applyRoPEToProjectedHeadsWithTableInPlace(
+            self.spec.attentionSpec(),
+            workspace.q_proj,
+            workspace.k_proj,
+            &workspace.rope_table,
+            position,
+        );
+        try cache.append(workspace.k_proj, workspace.v_proj);
 
         switch (cache.scheme) {
+            .auto => unreachable,
             .bf16 => try gqa_attention.forwardProjectedSingleTokenBf16Cache(
                 self.spec.attentionSpec(),
                 workspace.attn_flat,
-                workspace.q_normed,
+                workspace.q_proj,
                 cache.currentBf16Keys(),
                 cache.currentBf16Values(),
                 cache.len,
@@ -289,7 +296,7 @@ const LayerWeights = struct {
             .q8 => try gqa_attention.forwardProjectedSingleTokenQ8Cache(
                 self.spec.attentionSpec(),
                 workspace.attn_flat,
-                workspace.q_normed,
+                workspace.q_proj,
                 cache.currentQ8Keys(),
                 cache.currentQ8KeyScales(),
                 cache.currentQ8Values(),
@@ -299,16 +306,16 @@ const LayerWeights = struct {
             ),
         }
 
-        try runtime.backend.matmulVecByName(workspace.attn_out, self.o_proj_name, workspace.attn_flat, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
+        try runtime.backend.matmulVec(workspace.attn_out, self.o_proj_tensor, workspace.attn_flat, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
         for (workspace.post_attn, hidden_in, workspace.attn_out) |*out, residual, attn_value| {
             out.* = residual + attn_value;
         }
 
-        try cpu.rmsNorm(workspace.post_normed, workspace.post_attn, self.post_ln_weight, self.spec.rms_norm_eps);
-        try runtime.backend.matmulVecByName(workspace.gate, self.gate_proj_name, workspace.post_normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
-        try runtime.backend.matmulVecByName(workspace.up, self.up_proj_name, workspace.post_normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
-        try cpu.swiglu(workspace.activated, workspace.gate, workspace.up);
-        try runtime.backend.matmulVecByName(workspace.mlp_out, self.down_proj_name, workspace.activated, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
+        try cpu.rmsNorm(workspace.normed, workspace.post_attn, self.post_ln_weight, self.spec.rms_norm_eps);
+        try runtime.backend.matmulVec(workspace.gate, self.gate_proj_tensor, workspace.normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
+        try runtime.backend.matmulVec(workspace.up, self.up_proj_tensor, workspace.normed, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
+        try cpu.swiglu(workspace.gate, workspace.gate, workspace.up);
+        try runtime.backend.matmulVec(workspace.mlp_out, self.down_proj_tensor, workspace.gate, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
 
         for (hidden_out, workspace.post_attn, workspace.mlp_out) |*out, residual, mlp_value| {
             out.* = residual + mlp_value;
@@ -324,23 +331,26 @@ pub const Workspace = struct {
     q_proj: []f32,
     k_proj: []f32,
     v_proj: []f32,
-    q_normed: []f32,
-    k_normed: []f32,
     attn_flat: []f32,
     scores: []f32,
     attn_out: []f32,
     post_attn: []f32,
-    post_normed: []f32,
     gate: []f32,
     up: []f32,
-    activated: []f32,
     mlp_out: []f32,
-    final_hidden: []f32,
     logits: []f32,
     io_scratch: []u8,
+    rope_table: attention.RoPETable,
 
     fn init(allocator: std.mem.Allocator, cfg: decoder_family.DecoderConfig, max_seq_len: usize, io_scratch_bytes: usize) !Workspace {
         const kv_width = cfg.num_key_value_heads * cfg.head_dim;
+        var rope_table = try attention.RoPETable.init(
+            allocator,
+            max_seq_len,
+            cfg.head_dim,
+            @floatCast(cfg.rope_theta),
+        );
+        errdefer rope_table.deinit();
         return .{
             .allocator = allocator,
             .hidden_a = try allocator.alloc(f32, cfg.hidden_size),
@@ -349,20 +359,16 @@ pub const Workspace = struct {
             .q_proj = try allocator.alloc(f32, cfg.num_attention_heads * cfg.head_dim),
             .k_proj = try allocator.alloc(f32, kv_width),
             .v_proj = try allocator.alloc(f32, kv_width),
-            .q_normed = try allocator.alloc(f32, cfg.num_attention_heads * cfg.head_dim),
-            .k_normed = try allocator.alloc(f32, kv_width),
             .attn_flat = try allocator.alloc(f32, cfg.num_attention_heads * cfg.head_dim),
             .scores = try allocator.alloc(f32, max_seq_len),
             .attn_out = try allocator.alloc(f32, cfg.hidden_size),
             .post_attn = try allocator.alloc(f32, cfg.hidden_size),
-            .post_normed = try allocator.alloc(f32, cfg.hidden_size),
             .gate = try allocator.alloc(f32, cfg.intermediate_size),
             .up = try allocator.alloc(f32, cfg.intermediate_size),
-            .activated = try allocator.alloc(f32, cfg.intermediate_size),
             .mlp_out = try allocator.alloc(f32, cfg.hidden_size),
-            .final_hidden = try allocator.alloc(f32, cfg.hidden_size),
             .logits = try allocator.alloc(f32, cfg.vocab_size),
             .io_scratch = try allocator.alloc(u8, io_scratch_bytes),
+            .rope_table = rope_table,
         };
     }
 
@@ -373,20 +379,16 @@ pub const Workspace = struct {
         self.allocator.free(self.q_proj);
         self.allocator.free(self.k_proj);
         self.allocator.free(self.v_proj);
-        self.allocator.free(self.q_normed);
-        self.allocator.free(self.k_normed);
         self.allocator.free(self.attn_flat);
         self.allocator.free(self.scores);
         self.allocator.free(self.attn_out);
         self.allocator.free(self.post_attn);
-        self.allocator.free(self.post_normed);
         self.allocator.free(self.gate);
         self.allocator.free(self.up);
-        self.allocator.free(self.activated);
         self.allocator.free(self.mlp_out);
-        self.allocator.free(self.final_hidden);
         self.allocator.free(self.logits);
         self.allocator.free(self.io_scratch);
+        self.rope_table.deinit();
     }
 };
 
@@ -405,13 +407,16 @@ fn allocVector(
     return output;
 }
 
-fn allocMatrixName(
+fn resolveMatrixTensor(
+    backend: *tensor_backend.Backend,
     allocator: std.mem.Allocator,
     cfg: decoder_family.DecoderConfig,
     layer_index: usize,
     kind: weights_layout.LayerTensorKind,
-) ![]u8 {
-    return try decoder_family.layerTensorNameAlloc(allocator, cfg.architecture, layer_index, kind);
+) !tensor_backend.Backend.TensorHandle {
+    const name = try decoder_family.layerTensorNameAlloc(allocator, cfg.architecture, layer_index, kind);
+    defer allocator.free(name);
+    return try backend.resolveTensor(name);
 }
 
 fn maxIoScratchBytes(cfg: decoder_family.DecoderConfig) usize {

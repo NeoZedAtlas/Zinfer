@@ -374,7 +374,7 @@ fn printUsage() !void {
         \\  --repetition-penalty <f32>
         \\  --stop <text>           (repeatable)
         \\  --backend <auto|bf16|q8|q4>
-        \\  --kv-cache <bf16|q8>
+        \\  --kv-cache <auto|bf16|q8>
         \\  --threads <usize>       (0 = auto)
         \\  --stream
         \\  --load <path>           (chat only)
@@ -574,7 +574,7 @@ fn initGenerateOptions(mode: decoder_family.ThinkingMode, max_new_tokens: usize)
         .stream_output = false,
         .stop_sequences = &.{},
         .backend_scheme = .auto,
-        .kv_cache_scheme = .bf16,
+        .kv_cache_scheme = .auto,
         .thread_count = 0,
     };
 }
@@ -717,6 +717,7 @@ fn parseBackendScheme(text: []const u8) !tensor_backend.Scheme {
 }
 
 fn parseKvCacheScheme(text: []const u8) !optimized_kv_cache.Scheme {
+    if (std.mem.eql(u8, text, "auto")) return .auto;
     if (std.mem.eql(u8, text, "bf16")) return .bf16;
     if (std.mem.eql(u8, text, "q8")) return .q8;
     return error.InvalidKvCacheScheme;
@@ -1059,6 +1060,7 @@ fn benchPrompt(
     var runtime = try GeneratorRuntime.init(allocator, model_dir, options.backend_scheme, options.thread_count);
     defer runtime.deinit();
     const cfg = runtime.model.cfg;
+    const resolved_kv_cache_scheme = optimized_kv_cache.resolveScheme(options.kv_cache_scheme, runtime.model.backendName());
 
     const prompt = try buildSingleUserPromptAlloc(
         allocator,
@@ -1087,7 +1089,7 @@ fn benchPrompt(
         prompt_ids.len + options.max_new_tokens,
         cfg.num_key_value_heads,
         cfg.head_dim,
-        options.kv_cache_scheme,
+        resolved_kv_cache_scheme,
     );
     defer cache.deinit();
     var workspace = try runtime.model.initWorkspace(prompt_ids.len + options.max_new_tokens);
@@ -1111,13 +1113,13 @@ fn benchPrompt(
     }
     const decode_ns = decode_timer.read();
 
-    const weights_size = try weightArtifactSize(allocator, model_dir, runtime.model.backendName());
-    const kv_cache_bytes = estimateKvCacheBytes(cfg, prompt_ids.len + options.max_new_tokens, options.kv_cache_scheme);
+    const weights_size = runtime.model.artifactBytes();
+    const kv_cache_bytes = estimateKvCacheBytes(cfg, prompt_ids.len + options.max_new_tokens, resolved_kv_cache_scheme);
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("Zinfer benchmark\n", .{});
     try stdout.print("model_dir: {s}\n", .{model_dir});
     try stdout.print("backend: {s}\n", .{runtime.model.backendName()});
-    try stdout.print("kv_cache: {s}\n", .{options.kv_cache_scheme.name()});
+    try stdout.print("kv_cache: {s}\n", .{resolved_kv_cache_scheme.name()});
     try stdout.print("threads: {d}\n", .{runtime.model.thread_count});
     try stdout.print("prompt_tokens: {d}\n", .{prompt_ids.len});
     try stdout.print("decode_tokens: {d}\n", .{decoded_tokens});
@@ -1190,18 +1192,6 @@ fn fileSizeAtPath(path: []const u8) !u64 {
     defer file.close();
     const stat = try file.stat();
     return stat.size;
-}
-
-fn weightArtifactSize(allocator: std.mem.Allocator, model_dir: []const u8, backend_name: []const u8) !u64 {
-    const file_name = if (std.mem.eql(u8, backend_name, "q4"))
-        "model.q4.zinfer"
-    else if (std.mem.eql(u8, backend_name, "q8"))
-        "model.q8.zinfer"
-    else
-        "model.safetensors";
-    const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
-    defer allocator.free(path);
-    return fileSizeAtPath(path);
 }
 
 fn estimateKvCacheBytes(
@@ -1632,13 +1622,14 @@ const GeneratorRuntime = struct {
         }
 
         const cfg = self.model.cfg;
+        const resolved_kv_cache_scheme = optimized_kv_cache.resolveScheme(options.kv_cache_scheme, self.model.backendName());
         var cache = try optimized_kv_cache.ModelCache.init(
             self.allocator,
             cfg.num_hidden_layers,
             prompt_ids.len + options.max_new_tokens,
             cfg.num_key_value_heads,
             cfg.head_dim,
-            options.kv_cache_scheme,
+            resolved_kv_cache_scheme,
         );
         defer cache.deinit();
         var workspace = try self.model.initWorkspace(prompt_ids.len + options.max_new_tokens);

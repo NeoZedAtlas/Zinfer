@@ -2,16 +2,27 @@ const std = @import("std");
 const bfloat16 = @import("../tensor/bfloat16.zig");
 
 pub const Scheme = enum {
+    auto,
     bf16,
     q8,
 
     pub fn name(self: Scheme) []const u8 {
         return switch (self) {
+            .auto => "auto",
             .bf16 => "bf16",
             .q8 => "q8",
         };
     }
 };
+
+pub fn resolveScheme(cache_scheme: Scheme, backend_name: []const u8) Scheme {
+    return switch (cache_scheme) {
+        .auto => if (std.mem.eql(u8, backend_name, "q8")) .q8 else .bf16,
+        else => cache_scheme,
+    };
+}
+
+pub const q8_group_size: usize = 16;
 
 pub const LayerKVCache = struct {
     allocator: std.mem.Allocator,
@@ -35,7 +46,7 @@ pub const LayerKVCache = struct {
         scheme: Scheme,
     ) !LayerKVCache {
         const total = try std.math.mul(usize, max_seq_len, try std.math.mul(usize, num_key_value_heads, head_dim));
-        const scale_total = try std.math.mul(usize, max_seq_len, num_key_value_heads);
+        const scale_total = try std.math.mul(usize, max_seq_len, selfScaleGroupsPerToken(num_key_value_heads, head_dim));
 
         const keys_bf16 = try allocator.alloc(u16, if (scheme == .bf16) total else 0);
         errdefer allocator.free(keys_bf16);
@@ -89,6 +100,7 @@ pub const LayerKVCache = struct {
         if (key.len != token_width or value.len != token_width) return error.SizeMismatch;
 
         switch (self.scheme) {
+            .auto => unreachable,
             .bf16 => self.appendBf16(key, value),
             .q8 => self.appendQ8(key, value),
         }
@@ -117,16 +129,24 @@ pub const LayerKVCache = struct {
 
     pub fn currentQ8KeyScales(self: *const LayerKVCache) []const u16 {
         std.debug.assert(self.scheme == .q8);
-        return self.key_scales_q8[0 .. self.len * self.num_key_value_heads];
+        return self.key_scales_q8[0 .. self.len * self.scaleGroupsPerToken()];
     }
 
     pub fn currentQ8ValueScales(self: *const LayerKVCache) []const u16 {
         std.debug.assert(self.scheme == .q8);
-        return self.value_scales_q8[0 .. self.len * self.num_key_value_heads];
+        return self.value_scales_q8[0 .. self.len * self.scaleGroupsPerToken()];
     }
 
     pub fn numKeyValueElementsPerToken(self: *const LayerKVCache) usize {
         return self.num_key_value_heads * self.head_dim;
+    }
+
+    pub fn scaleGroupsPerHead(self: *const LayerKVCache) usize {
+        return std.math.divCeil(usize, self.head_dim, q8_group_size) catch unreachable;
+    }
+
+    pub fn scaleGroupsPerToken(self: *const LayerKVCache) usize {
+        return self.num_key_value_heads * self.scaleGroupsPerHead();
     }
 
     fn appendBf16(self: *LayerKVCache, key: []const f32, value: []const f32) void {
@@ -141,7 +161,8 @@ pub const LayerKVCache = struct {
 
     fn appendQ8(self: *LayerKVCache, key: []const f32, value: []const f32) void {
         const token_start = self.len * self.numKeyValueElementsPerToken();
-        const scale_start = self.len * self.num_key_value_heads;
+        const scale_start = self.len * self.scaleGroupsPerToken();
+        const scale_groups_per_head = self.scaleGroupsPerHead();
 
         for (0..self.num_key_value_heads) |head_idx| {
             const head_start = head_idx * self.head_dim;
@@ -149,9 +170,20 @@ pub const LayerKVCache = struct {
             const value_slice = value[head_start .. head_start + self.head_dim];
             const key_out = self.keys_q8[token_start + head_start .. token_start + head_start + self.head_dim];
             const value_out = self.values_q8[token_start + head_start .. token_start + head_start + self.head_dim];
+            const head_scale_start = scale_start + head_idx * scale_groups_per_head;
 
-            self.key_scales_q8[scale_start + head_idx] = quantizeQ8Slice(key_out, key_slice);
-            self.value_scales_q8[scale_start + head_idx] = quantizeQ8Slice(value_out, value_slice);
+            for (0..scale_groups_per_head) |group_idx| {
+                const group_start = group_idx * q8_group_size;
+                const group_end = @min(self.head_dim, group_start + q8_group_size);
+                self.key_scales_q8[head_scale_start + group_idx] = quantizeQ8Slice(
+                    key_out[group_start..group_end],
+                    key_slice[group_start..group_end],
+                );
+                self.value_scales_q8[head_scale_start + group_idx] = quantizeQ8Slice(
+                    value_out[group_start..group_end],
+                    value_slice[group_start..group_end],
+                );
+            }
         }
     }
 };
@@ -204,6 +236,7 @@ pub fn estimateBytes(
     scheme: Scheme,
 ) u64 {
     return switch (scheme) {
+        .auto => unreachable,
         .bf16 => blk: {
             const total = @as(u128, num_layers) *
                 @as(u128, max_seq_len) *
@@ -214,6 +247,7 @@ pub fn estimateBytes(
             break :blk @intCast(total);
         },
         .q8 => blk: {
+            const scale_groups_per_head = std.math.divCeil(usize, head_dim, q8_group_size) catch unreachable;
             const quantized = @as(u128, num_layers) *
                 @as(u128, max_seq_len) *
                 @as(u128, num_key_value_heads) *
@@ -223,6 +257,7 @@ pub fn estimateBytes(
             const scales = @as(u128, num_layers) *
                 @as(u128, max_seq_len) *
                 @as(u128, num_key_value_heads) *
+                @as(u128, scale_groups_per_head) *
                 2 *
                 @sizeOf(u16);
             break :blk @intCast(quantized + scales);
@@ -242,6 +277,10 @@ fn quantizeQ8Slice(output: []i8, input: []const f32) u16 {
         output[idx] = @intCast(quantized);
     }
     return bfloat16.fromF32(scale);
+}
+
+fn selfScaleGroupsPerToken(num_key_value_heads: usize, head_dim: usize) usize {
+    return num_key_value_heads * (std.math.divCeil(usize, head_dim, q8_group_size) catch unreachable);
 }
 
 test "optimized kv cache stores bf16 values in order" {

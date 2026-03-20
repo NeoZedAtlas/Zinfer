@@ -52,6 +52,33 @@ pub fn applyRoPEToProjectedHeadsInPlace(
     );
 }
 
+pub fn applyRoPEToProjectedHeadsWithTableInPlace(
+    spec: AttentionSpec,
+    projected_query: []f32,
+    projected_key: []f32,
+    table: *const attention.RoPETable,
+    position: usize,
+) !void {
+    try spec.validate();
+    if (projected_query.len != spec.num_attention_heads * spec.head_dim) return error.SizeMismatch;
+    if (projected_key.len != spec.num_key_value_heads * spec.head_dim) return error.SizeMismatch;
+
+    try attention.applyRoPEToHeadsWithTableInPlace(
+        projected_query,
+        spec.num_attention_heads,
+        spec.head_dim,
+        table,
+        position,
+    );
+    try attention.applyRoPEToHeadsWithTableInPlace(
+        projected_key,
+        spec.num_key_value_heads,
+        spec.head_dim,
+        table,
+        position,
+    );
+}
+
 pub fn forwardProjectedSingleToken(
     spec: AttentionSpec,
     output: []f32,
