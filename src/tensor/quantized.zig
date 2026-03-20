@@ -275,14 +275,32 @@ pub const Store = struct {
         start_row: usize,
         end_row: usize,
     ) void {
-        for (start_row..end_row) |row_idx| {
-            const row_offset = tensor.absolute_offset + @as(u64, row_idx) * tensor.row_bytes;
-            output[row_idx] = switch (tensor.encoding) {
-                .f32 => dotF32Row(self.bytes, row_offset, input),
-                .q6_0 => dotQ6Row(self.bytes, row_offset, input),
-                .q8_0 => dotQ8Row(self.bytes, row_offset, input),
-                .q4_0 => dotQ4Row(self.bytes, row_offset, input),
-            };
+        var row_offset = tensor.absolute_offset + @as(u64, start_row) * tensor.row_bytes;
+        switch (tensor.encoding) {
+            .f32 => {
+                for (start_row..end_row) |row_idx| {
+                    output[row_idx] = dotF32Row(self.bytes, row_offset, input);
+                    row_offset += tensor.row_bytes;
+                }
+            },
+            .q6_0 => {
+                for (start_row..end_row) |row_idx| {
+                    output[row_idx] = dotQ6Row(self.bytes, row_offset, input);
+                    row_offset += tensor.row_bytes;
+                }
+            },
+            .q8_0 => {
+                for (start_row..end_row) |row_idx| {
+                    output[row_idx] = dotQ8Row(self.bytes, row_offset, input);
+                    row_offset += tensor.row_bytes;
+                }
+            },
+            .q4_0 => {
+                for (start_row..end_row) |row_idx| {
+                    output[row_idx] = dotQ4Row(self.bytes, row_offset, input);
+                    row_offset += tensor.row_bytes;
+                }
+            },
         }
     }
 

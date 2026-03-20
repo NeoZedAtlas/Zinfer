@@ -45,8 +45,8 @@ pub const Backend = union(Scheme) {
             .q8 => .{ .q8 = try quantized.Store.open(allocator, q8_path) },
             .bf16 => .{ .bf16 = try tensor_store.TensorStore.open(allocator, bf16_path) },
             .auto => blk: {
-                if (pathExists(q4_path)) break :blk .{ .q4 = try quantized.Store.open(allocator, q4_path) };
                 if (pathExists(q6_path)) break :blk .{ .q6 = try quantized.Store.open(allocator, q6_path) };
+                if (pathExists(q4_path)) break :blk .{ .q4 = try quantized.Store.open(allocator, q4_path) };
                 if (pathExists(q8_path)) break :blk .{ .q8 = try quantized.Store.open(allocator, q8_path) };
                 break :blk .{ .bf16 = try tensor_store.TensorStore.open(allocator, bf16_path) };
             },

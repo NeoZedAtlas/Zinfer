@@ -292,19 +292,28 @@ pub const TensorStore = struct {
     ) void {
         const cols = input.len;
         const row_bytes = std.math.cast(usize, @as(u64, cols) * tensor.dtype.byteSize()) orelse unreachable;
+        var row_offset = std.math.add(
+            u64,
+            tensor.absolute_offset,
+            std.math.mul(u64, start_row, row_bytes) catch unreachable,
+        ) catch unreachable;
 
-        for (start_row..end_row) |row_idx| {
-            const row_offset = std.math.add(
-                u64,
-                tensor.absolute_offset,
-                std.math.mul(u64, row_idx, row_bytes) catch unreachable,
-            ) catch unreachable;
-            const row = self.byteRange(row_offset, row_bytes) catch unreachable;
-            output[row_idx] = switch (tensor.dtype) {
-                .bf16 => dotBf16Row(row, input),
-                .f32 => dotF32Row(row, input),
-                else => unreachable,
-            };
+        switch (tensor.dtype) {
+            .bf16 => {
+                for (start_row..end_row) |row_idx| {
+                    const row = self.byteRange(row_offset, row_bytes) catch unreachable;
+                    output[row_idx] = dotBf16Row(row, input);
+                    row_offset += row_bytes;
+                }
+            },
+            .f32 => {
+                for (start_row..end_row) |row_idx| {
+                    const row = self.byteRange(row_offset, row_bytes) catch unreachable;
+                    output[row_idx] = dotF32Row(row, input);
+                    row_offset += row_bytes;
+                }
+            },
+            else => unreachable,
         }
     }
 

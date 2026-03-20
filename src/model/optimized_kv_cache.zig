@@ -17,7 +17,7 @@ pub const Scheme = enum {
 
 pub fn resolveScheme(cache_scheme: Scheme, backend_name: []const u8) Scheme {
     return switch (cache_scheme) {
-        .auto => if (std.mem.eql(u8, backend_name, "q8")) .q8 else .bf16,
+        .auto => if (std.mem.eql(u8, backend_name, "bf16")) .bf16 else .q8,
         else => cache_scheme,
     };
 }
