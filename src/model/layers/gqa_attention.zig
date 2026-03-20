@@ -1,5 +1,5 @@
 const std = @import("std");
-const attention = @import("../kernel/attention.zig");
+const attention = @import("../../kernel/attention.zig");
 
 pub const AttentionSpec = struct {
     hidden_size: usize,

@@ -1,5 +1,5 @@
 const std = @import("std");
-const weights_layout = @import("../../weights_layout.zig");
+const weights_layout = @import("../../layers/weights_layout.zig");
 
 pub const common_weights = weights_layout.CommonWeights{
     .embed_tokens_weight = "model.embed_tokens.weight",

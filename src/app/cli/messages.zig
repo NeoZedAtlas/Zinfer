@@ -1,5 +1,5 @@
 const std = @import("std");
-const decoder_family = @import("../../model/decoder_family.zig");
+const decoder_family = @import("../../model/runtime/decoder_family.zig");
 
 pub const LoadedChatMessages = struct {
     arena: std.heap.ArenaAllocator,

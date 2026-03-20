@@ -1,6 +1,6 @@
 const std = @import("std");
 const bpe_tokenizer = @import("../../../tokenizer/bpe.zig");
-const chat_types = @import("../../chat_types.zig");
+const chat_types = @import("../../runtime/chat_types.zig");
 
 pub const ThinkingMode = chat_types.ThinkingMode;
 pub const Role = chat_types.Role;

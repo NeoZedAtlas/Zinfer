@@ -1,5 +1,5 @@
 const std = @import("std");
-const bfloat16 = @import("../tensor/bfloat16.zig");
+const bfloat16 = @import("../../tensor/bfloat16.zig");
 
 pub const Scheme = enum {
     auto,

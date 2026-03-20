@@ -1,9 +1,9 @@
 const std = @import("std");
-const cpu = @import("../kernel/cpu.zig");
-const decoder_cache = @import("decoder_cache.zig");
-const decoder_types = @import("decoder_types.zig");
+const cpu = @import("../../kernel/cpu.zig");
+const decoder_cache = @import("../runtime/decoder_cache.zig");
+const decoder_types = @import("../runtime/decoder_types.zig");
 const generic_block = @import("rmsnorm_gqa_swiglu_block.zig");
-const tensor_store = @import("../tensor/store.zig");
+const tensor_store = @import("../../tensor/store.zig");
 const weights_layout = @import("weights_layout.zig");
 
 pub const Config = struct {

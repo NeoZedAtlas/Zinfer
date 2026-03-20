@@ -3,8 +3,8 @@ const GenerateOptions = @import("args.zig").GenerateOptions;
 const cli_prompts = @import("prompts.zig");
 const cli_runtime = @import("runtime.zig");
 const cli_token_ids = @import("token_ids.zig");
-const optimized_kv_cache = @import("../../model/optimized_kv_cache.zig");
-const decoder_family = @import("../../model/decoder_family.zig");
+const optimized_kv_cache = @import("../../model/runtime/optimized_kv_cache.zig");
+const decoder_family = @import("../../model/runtime/decoder_family.zig");
 const quantized = @import("../../tensor/quantized.zig");
 
 pub fn benchPrompt(

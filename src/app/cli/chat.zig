@@ -4,7 +4,7 @@ const GenerateOptions = cli_args.GenerateOptions;
 const cli_messages = @import("messages.zig");
 const cli_prompts = @import("prompts.zig");
 const cli_runtime = @import("runtime.zig");
-const decoder_family = @import("../../model/decoder_family.zig");
+const decoder_family = @import("../../model/runtime/decoder_family.zig");
 
 pub const SessionMetadata = struct {
     model_dir: []const u8,

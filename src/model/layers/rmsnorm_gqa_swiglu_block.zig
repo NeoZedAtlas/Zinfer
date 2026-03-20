@@ -1,7 +1,7 @@
 const std = @import("std");
-const cpu = @import("../kernel/cpu.zig");
-const tensor_store = @import("../tensor/store.zig");
-const kv_cache_mod = @import("kv_cache.zig");
+const cpu = @import("../../kernel/cpu.zig");
+const tensor_store = @import("../../tensor/store.zig");
+const kv_cache_mod = @import("../runtime/kv_cache.zig");
 const gqa_attention = @import("gqa_attention.zig");
 const weights_layout = @import("weights_layout.zig");
 

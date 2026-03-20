@@ -1,15 +1,15 @@
 const std = @import("std");
-const tensor_store = @import("../tensor/store.zig");
+const tensor_store = @import("../../tensor/store.zig");
 const kv_cache = @import("kv_cache.zig");
 const decoder_cache = @import("decoder_cache.zig");
-const decoder_only_stack = @import("decoder_only_stack.zig");
+const decoder_only_stack = @import("../layers/decoder_only_stack.zig");
 const chat_types = @import("chat_types.zig");
 const decoder_registry = @import("decoder_registry.zig");
 const decoder_types = @import("decoder_types.zig");
-const generic_block = @import("rmsnorm_gqa_swiglu_block.zig");
-const logits_util = @import("logits.zig");
-const weights_layout = @import("weights_layout.zig");
-const qwen3_family = @import("adapters/qwen3/family.zig");
+const generic_block = @import("../layers/rmsnorm_gqa_swiglu_block.zig");
+const logits_util = @import("../layers/logits.zig");
+const weights_layout = @import("../layers/weights_layout.zig");
+const qwen3_family = @import("../families/qwen3/family.zig");
 
 pub const Architecture = decoder_types.Architecture;
 pub const ThinkingMode = chat_types.ThinkingMode;

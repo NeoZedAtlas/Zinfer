@@ -1,6 +1,6 @@
 const std = @import("std");
-const optimized_kv_cache = @import("../../model/optimized_kv_cache.zig");
-const decoder_family = @import("../../model/decoder_family.zig");
+const optimized_kv_cache = @import("../../model/runtime/optimized_kv_cache.zig");
+const decoder_family = @import("../../model/runtime/decoder_family.zig");
 const tensor_backend = @import("../../tensor/backend.zig");
 const sampler = @import("../../sampling/sampler.zig");
 
