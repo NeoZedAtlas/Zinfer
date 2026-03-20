@@ -20,6 +20,7 @@ const GenerateOptions = struct {
     stream_output: bool,
     stop_sequences: [][]const u8,
     backend_scheme: tensor_backend.Scheme,
+    kv_cache_scheme: optimized_kv_cache.Scheme,
     thread_count: usize,
 
     fn deinit(self: *GenerateOptions, allocator: std.mem.Allocator) void {
@@ -373,6 +374,7 @@ fn printUsage() !void {
         \\  --repetition-penalty <f32>
         \\  --stop <text>           (repeatable)
         \\  --backend <auto|bf16|q8|q4>
+        \\  --kv-cache <bf16|q8>
         \\  --threads <usize>       (0 = auto)
         \\  --stream
         \\  --load <path>           (chat only)
@@ -572,6 +574,7 @@ fn initGenerateOptions(mode: decoder_family.ThinkingMode, max_new_tokens: usize)
         .stream_output = false,
         .stop_sequences = &.{},
         .backend_scheme = .auto,
+        .kv_cache_scheme = .bf16,
         .thread_count = 0,
     };
 }
@@ -682,6 +685,12 @@ fn parseGenerateFlags(
             options.backend_scheme = try parseBackendScheme(args[i]);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--kv-cache")) {
+            i += 1;
+            if (i >= args.len) return error.MissingFlagValue;
+            options.kv_cache_scheme = try parseKvCacheScheme(args[i]);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--threads")) {
             i += 1;
             if (i >= args.len) return error.MissingFlagValue;
@@ -705,6 +714,12 @@ fn parseBackendScheme(text: []const u8) !tensor_backend.Scheme {
     if (std.mem.eql(u8, text, "q8")) return .q8;
     if (std.mem.eql(u8, text, "q4")) return .q4;
     return error.InvalidBackendScheme;
+}
+
+fn parseKvCacheScheme(text: []const u8) !optimized_kv_cache.Scheme {
+    if (std.mem.eql(u8, text, "bf16")) return .bf16;
+    if (std.mem.eql(u8, text, "q8")) return .q8;
+    return error.InvalidKvCacheScheme;
 }
 
 fn parseChatFlags(
@@ -1072,6 +1087,7 @@ fn benchPrompt(
         prompt_ids.len + options.max_new_tokens,
         cfg.num_key_value_heads,
         cfg.head_dim,
+        options.kv_cache_scheme,
     );
     defer cache.deinit();
     var workspace = try runtime.model.initWorkspace(prompt_ids.len + options.max_new_tokens);
@@ -1096,11 +1112,12 @@ fn benchPrompt(
     const decode_ns = decode_timer.read();
 
     const weights_size = try weightArtifactSize(allocator, model_dir, runtime.model.backendName());
-    const kv_cache_bytes = estimateKvCacheBytes(cfg, prompt_ids.len + options.max_new_tokens, true);
+    const kv_cache_bytes = estimateKvCacheBytes(cfg, prompt_ids.len + options.max_new_tokens, options.kv_cache_scheme);
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("Zinfer benchmark\n", .{});
     try stdout.print("model_dir: {s}\n", .{model_dir});
     try stdout.print("backend: {s}\n", .{runtime.model.backendName()});
+    try stdout.print("kv_cache: {s}\n", .{options.kv_cache_scheme.name()});
     try stdout.print("threads: {d}\n", .{runtime.model.thread_count});
     try stdout.print("prompt_tokens: {d}\n", .{prompt_ids.len});
     try stdout.print("decode_tokens: {d}\n", .{decoded_tokens});
@@ -1187,23 +1204,18 @@ fn weightArtifactSize(allocator: std.mem.Allocator, model_dir: []const u8, backe
     return fileSizeAtPath(path);
 }
 
-fn estimateKvCacheBytes(cfg: decoder_family.DecoderConfig, max_seq_len: usize, use_optimized_bf16_cache: bool) u64 {
-    if (use_optimized_bf16_cache) {
-        return optimized_kv_cache.estimateBytes(
-            cfg.num_hidden_layers,
-            max_seq_len,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-        );
-    }
-
-    const total = @as(u128, cfg.num_hidden_layers) *
-        @as(u128, max_seq_len) *
-        @as(u128, cfg.num_key_value_heads) *
-        @as(u128, cfg.head_dim) *
-        2 *
-        @sizeOf(f32);
-    return @intCast(total);
+fn estimateKvCacheBytes(
+    cfg: decoder_family.DecoderConfig,
+    max_seq_len: usize,
+    kv_cache_scheme: optimized_kv_cache.Scheme,
+) u64 {
+    return optimized_kv_cache.estimateBytes(
+        cfg.num_hidden_layers,
+        max_seq_len,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        kv_cache_scheme,
+    );
 }
 
 fn nsToMs(ns: u64) f64 {
@@ -1626,6 +1638,7 @@ const GeneratorRuntime = struct {
             prompt_ids.len + options.max_new_tokens,
             cfg.num_key_value_heads,
             cfg.head_dim,
+            options.kv_cache_scheme,
         );
         defer cache.deinit();
         var workspace = try self.model.initWorkspace(prompt_ids.len + options.max_new_tokens);
@@ -1879,6 +1892,9 @@ const ChatHistory = struct {
         try writer.writeAll("    \"backend\": ");
         try writer.print("{f}", .{std.json.fmt(metadata.options.backend_scheme.name(), .{})});
         try writer.writeAll(",\n");
+        try writer.writeAll("    \"kv_cache\": ");
+        try writer.print("{f}", .{std.json.fmt(metadata.options.kv_cache_scheme.name(), .{})});
+        try writer.writeAll(",\n");
         try writer.writeAll("    \"threads\": ");
         try writer.print("{d}", .{metadata.options.thread_count});
         try writer.writeAll(",\n");
@@ -2019,6 +2035,7 @@ test "chat history session save and load preserves tool calls" {
             .stream_output = true,
             .stop_sequences = @constCast(stop_sequences[0..]),
             .backend_scheme = .q4,
+            .kv_cache_scheme = .q8,
             .thread_count = 8,
         },
     });

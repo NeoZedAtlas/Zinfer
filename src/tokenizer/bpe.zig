@@ -109,7 +109,10 @@ pub const Tokenizer = struct {
         errdefer allocator.free(raw);
         if (std.unicode.utf8ValidateSlice(raw)) return raw;
 
-        const fixed = try std.unicode.wtf8ToUtf8LossyAlloc(allocator, raw);
+        const fixed = std.unicode.wtf8ToUtf8LossyAlloc(allocator, raw) catch |err| switch (err) {
+            error.InvalidWtf8 => try utf8LossyAlloc(allocator, raw),
+            else => return err,
+        };
         allocator.free(raw);
         return fixed;
     }
@@ -147,6 +150,30 @@ pub const Tokenizer = struct {
         return false;
     }
 };
+
+fn utf8LossyAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < raw.len) {
+        const expected_len = std.unicode.utf8ByteSequenceLength(raw[index]) catch {
+            try output.appendSlice(allocator, "\xEF\xBF\xBD");
+            index += 1;
+            continue;
+        };
+        if (index + expected_len <= raw.len and std.unicode.utf8ValidateSlice(raw[index .. index + expected_len])) {
+            try output.appendSlice(allocator, raw[index .. index + expected_len]);
+            index += expected_len;
+            continue;
+        }
+
+        try output.appendSlice(allocator, "\xEF\xBF\xBD");
+        index += 1;
+    }
+
+    return output.toOwnedSlice(allocator);
+}
 
 test "bpe tokenizer encodes known samples" {
     const testing = std.testing;

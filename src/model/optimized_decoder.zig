@@ -276,15 +276,28 @@ const LayerWeights = struct {
         try gqa_attention.applyRoPEToProjectedHeadsInPlace(self.spec.attentionSpec(), workspace.q_normed, workspace.k_normed, position);
         try cache.append(workspace.k_normed, workspace.v_proj);
 
-        try gqa_attention.forwardProjectedSingleTokenBf16Cache(
-            self.spec.attentionSpec(),
-            workspace.attn_flat,
-            workspace.q_normed,
-            cache.currentKeys(),
-            cache.currentValues(),
-            cache.len,
-            workspace.scores[0..cache.len],
-        );
+        switch (cache.scheme) {
+            .bf16 => try gqa_attention.forwardProjectedSingleTokenBf16Cache(
+                self.spec.attentionSpec(),
+                workspace.attn_flat,
+                workspace.q_normed,
+                cache.currentBf16Keys(),
+                cache.currentBf16Values(),
+                cache.len,
+                workspace.scores[0..cache.len],
+            ),
+            .q8 => try gqa_attention.forwardProjectedSingleTokenQ8Cache(
+                self.spec.attentionSpec(),
+                workspace.attn_flat,
+                workspace.q_normed,
+                cache.currentQ8Keys(),
+                cache.currentQ8KeyScales(),
+                cache.currentQ8Values(),
+                cache.currentQ8ValueScales(),
+                cache.len,
+                workspace.scores[0..cache.len],
+            ),
+        }
 
         try runtime.backend.matmulVecByName(workspace.attn_out, self.o_proj_name, workspace.attn_flat, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);
         for (workspace.post_attn, hidden_in, workspace.attn_out) |*out, residual, attn_value| {

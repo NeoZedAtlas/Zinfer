@@ -170,6 +170,102 @@ pub fn scaledDotProductAttentionSingleQueryBf16Cache(
     }
 }
 
+pub fn scaledDotProductAttentionSingleQueryQ8Cache(
+    output: []f32,
+    query: []const f32,
+    key_cache: []const i8,
+    key_scales: []const u16,
+    value_cache: []const i8,
+    value_scales: []const u16,
+    seq_len: usize,
+    num_query_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    scores_scratch: []f32,
+) !void {
+    if (num_query_heads == 0 or num_key_value_heads == 0 or head_dim == 0) {
+        return error.InvalidDimensions;
+    }
+    if (num_query_heads % num_key_value_heads != 0) return error.InvalidGrouping;
+    if (seq_len == 0) return error.InvalidSequenceLength;
+    if (output.len != num_query_heads * head_dim) return error.SizeMismatch;
+    if (query.len != num_query_heads * head_dim) return error.SizeMismatch;
+    if (key_cache.len != seq_len * num_key_value_heads * head_dim) return error.SizeMismatch;
+    if (value_cache.len != seq_len * num_key_value_heads * head_dim) return error.SizeMismatch;
+    if (key_scales.len != seq_len * num_key_value_heads) return error.SizeMismatch;
+    if (value_scales.len != seq_len * num_key_value_heads) return error.SizeMismatch;
+    if (scores_scratch.len < seq_len) return error.InsufficientScratchSpace;
+
+    const group_size = num_query_heads / num_key_value_heads;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    @memset(output, 0.0);
+
+    for (0..num_query_heads) |q_head_idx| {
+        const q_start = q_head_idx * head_dim;
+        const q_slice = query[q_start .. q_start + head_dim];
+        const kv_head_idx = q_head_idx / group_size;
+        const scores = scores_scratch[0..seq_len];
+
+        for (0..seq_len) |pos| {
+            const scale_index = pos * num_key_value_heads + kv_head_idx;
+            const cache_start = scale_index * head_dim;
+            const key_scale = bfloat16.toF32(key_scales[scale_index]);
+            scores[pos] = (dotQ8Slice(q_slice, key_cache[cache_start .. cache_start + head_dim]) * key_scale) * scale;
+        }
+
+        try softmaxInPlace(scores);
+
+        const out_slice = output[q_start .. q_start + head_dim];
+        for (0..seq_len) |pos| {
+            const weight = scores[pos];
+            const scale_index = pos * num_key_value_heads + kv_head_idx;
+            const cache_start = scale_index * head_dim;
+            const value_scale = bfloat16.toF32(value_scales[scale_index]);
+            axpyQ8SliceInPlace(out_slice, weight * value_scale, value_cache[cache_start .. cache_start + head_dim]);
+        }
+    }
+}
+
+fn dotQ8Slice(lhs: []const f32, rhs_q8: []const i8) f32 {
+    std.debug.assert(lhs.len == rhs_q8.len);
+
+    var sum: f32 = 0.0;
+    var index: usize = 0;
+    while (index + 16 <= lhs.len) : (index += 16) {
+        const lhs_vec: @Vector(16, f32) = lhs[index..][0..16].*;
+        var rhs_arr: [16]f32 = undefined;
+        inline for (0..16) |lane| {
+            rhs_arr[lane] = @floatFromInt(rhs_q8[index + lane]);
+        }
+        const rhs_vec: @Vector(16, f32) = rhs_arr;
+        sum += @reduce(.Add, lhs_vec * rhs_vec);
+    }
+    while (index < lhs.len) : (index += 1) {
+        sum += lhs[index] * @as(f32, @floatFromInt(rhs_q8[index]));
+    }
+    return sum;
+}
+
+fn axpyQ8SliceInPlace(output: []f32, alpha: f32, input_q8: []const i8) void {
+    std.debug.assert(output.len == input_q8.len);
+
+    const alpha_vec: @Vector(16, f32) = @splat(alpha);
+    var index: usize = 0;
+    while (index + 16 <= output.len) : (index += 16) {
+        const out_vec: @Vector(16, f32) = output[index..][0..16].*;
+        var in_arr: [16]f32 = undefined;
+        inline for (0..16) |lane| {
+            in_arr[lane] = @floatFromInt(input_q8[index + lane]);
+        }
+        const in_vec: @Vector(16, f32) = in_arr;
+        output[index..][0..16].* = out_vec + alpha_vec * in_vec;
+    }
+    while (index < output.len) : (index += 1) {
+        output[index] += alpha * @as(f32, @floatFromInt(input_q8[index]));
+    }
+}
+
 test "rope leaves head unchanged at position zero" {
     const testing = std.testing;
 
@@ -352,4 +448,35 @@ test "single-query attention supports bf16 kv cache" {
     try testing.expect(output[0] < 20.0);
     try testing.expect(output[1] > 1.0);
     try testing.expect(output[1] < 2.0);
+}
+
+test "single-query attention supports q8 kv cache" {
+    const testing = std.testing;
+
+    const query = [_]f32{ 1.0, 0.0 };
+    const key_cache = [_]i8{ 127, 0, 0, 127 };
+    const value_cache = [_]i8{ 64, 6, 127, 13 };
+    const key_scales = [_]u16{ bfloat16.fromF32(1.0 / 127.0), bfloat16.fromF32(1.0 / 127.0) };
+    const value_scales = [_]u16{ bfloat16.fromF32(20.0 / 127.0), bfloat16.fromF32(20.0 / 127.0) };
+    var output = [_]f32{ 0.0, 0.0 };
+    var scores = [_]f32{ 0.0, 0.0 };
+
+    try scaledDotProductAttentionSingleQueryQ8Cache(
+        &output,
+        &query,
+        &key_cache,
+        &key_scales,
+        &value_cache,
+        &value_scales,
+        2,
+        1,
+        1,
+        2,
+        &scores,
+    );
+
+    try testing.expect(output[0] > 9.0);
+    try testing.expect(output[0] < 20.5);
+    try testing.expect(output[1] > 0.5);
+    try testing.expect(output[1] < 2.5);
 }
