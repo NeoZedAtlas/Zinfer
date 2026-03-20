@@ -52,7 +52,10 @@ pub const Pool = struct {
     }
 
     pub fn deinit(self: *Pool) void {
-        if (self.threads.len == 0) return;
+        if (self.threads.len == 0) {
+            self.allocator.destroy(self.shared);
+            return;
+        }
 
         self.shared.mutex.lock();
         self.shared.stop = true;

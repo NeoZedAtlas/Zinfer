@@ -735,6 +735,14 @@ fn decodeQ4Row(bytes: []const u8, row_offset: u64, output: []f32) void {
 }
 
 pub fn dotQ6Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
+    return switch (input.len) {
+        tensor_store.handwritten_hidden_width => dotQ6RowFixed(tensor_store.handwritten_hidden_width, bytes, row_offset, input),
+        tensor_store.handwritten_intermediate_width => dotQ6RowFixed(tensor_store.handwritten_intermediate_width, bytes, row_offset, input),
+        else => dotQ6RowGeneric(bytes, row_offset, input),
+    };
+}
+
+fn dotQ6RowGeneric(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     const start = @as(usize, @intCast(row_offset));
     const scale_bits = std.mem.readInt(u32, bytes[start .. start + 4][0..4], .little);
     const scale: f32 = @bitCast(scale_bits);
@@ -796,6 +804,32 @@ pub fn dotQ6Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     return sum * scale;
 }
 
+fn dotQ6RowFixed(comptime cols: usize, bytes: []const u8, row_offset: u64, input: []const f32) f32 {
+    std.debug.assert(input.len == cols);
+
+    const start = @as(usize, @intCast(row_offset));
+    const scale_bits = std.mem.readInt(u32, bytes[start .. start + 4][0..4], .little);
+    const scale: f32 = @bitCast(scale_bits);
+    const payload = bytes[start + 4 ..];
+
+    var acc0: @Vector(8, f32) = @splat(0.0);
+    var acc1: @Vector(8, f32) = @splat(0.0);
+    var index: usize = 0;
+    var payload_index: usize = 0;
+    while (index < cols) : ({
+        index += 16;
+        payload_index += 12;
+    }) {
+        const q0 = loadQ6Vector8(payload, payload_index);
+        const q1 = loadQ6Vector8(payload, payload_index + 6);
+        const rhs0: @Vector(8, f32) = input[index..][0..8].*;
+        const rhs1: @Vector(8, f32) = input[index + 8 ..][0..8].*;
+        acc0 += q0 * rhs0;
+        acc1 += q1 * rhs1;
+    }
+    return @reduce(.Add, acc0 + acc1) * scale;
+}
+
 fn writePackedBits(buffer: []u8, bit_index: usize, bit_width: u8, value: u8) void {
     var remaining = bit_width;
     var source: u16 = value;
@@ -836,28 +870,18 @@ fn readPackedBits(buffer: []const u8, bit_index: usize, bit_width: u8) u8 {
 
 fn dotF32Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     const start = @as(usize, @intCast(row_offset));
-    var sum: f32 = 0.0;
-    var index: usize = 0;
-    while (index + 16 <= input.len) : (index += 16) {
-        var lhs_arr: [16]f32 = undefined;
-        inline for (0..16) |lane| {
-            const offset = start + (index + lane) * 4;
-            const raw = std.mem.readInt(u32, bytes[offset .. offset + 4][0..4], .little);
-            lhs_arr[lane] = @bitCast(raw);
-        }
-        const lhs: @Vector(16, f32) = lhs_arr;
-        const rhs: @Vector(16, f32) = input[index..][0..16].*;
-        sum += @reduce(.Add, lhs * rhs);
-    }
-    while (index < input.len) : (index += 1) {
-        const offset = start + index * 4;
-        const raw = std.mem.readInt(u32, bytes[offset .. offset + 4][0..4], .little);
-        sum += @as(f32, @bitCast(raw)) * input[index];
-    }
-    return sum;
+    return tensor_store.dotF32Row(bytes[start .. start + input.len * 4], input);
 }
 
 pub fn dotQ8Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
+    return switch (input.len) {
+        tensor_store.handwritten_hidden_width => dotQ8RowFixed(tensor_store.handwritten_hidden_width, bytes, row_offset, input),
+        tensor_store.handwritten_intermediate_width => dotQ8RowFixed(tensor_store.handwritten_intermediate_width, bytes, row_offset, input),
+        else => dotQ8RowGeneric(bytes, row_offset, input),
+    };
+}
+
+fn dotQ8RowGeneric(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     const start = @as(usize, @intCast(row_offset));
     const scale_bits = std.mem.readInt(u32, bytes[start .. start + 4][0..4], .little);
     const scale: f32 = @bitCast(scale_bits);
@@ -880,7 +904,37 @@ pub fn dotQ8Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     return sum * scale;
 }
 
+fn dotQ8RowFixed(comptime cols: usize, bytes: []const u8, row_offset: u64, input: []const f32) f32 {
+    std.debug.assert(input.len == cols);
+
+    const start = @as(usize, @intCast(row_offset));
+    const scale_bits = std.mem.readInt(u32, bytes[start .. start + 4][0..4], .little);
+    const scale: f32 = @bitCast(scale_bits);
+    const payload = bytes[start + 4 ..];
+
+    var acc0: @Vector(16, f32) = @splat(0.0);
+    var acc1: @Vector(16, f32) = @splat(0.0);
+    var index: usize = 0;
+    while (index < cols) : (index += 32) {
+        const q0 = loadQ8Vector16(payload, index);
+        const q1 = loadQ8Vector16(payload, index + 16);
+        const rhs0: @Vector(16, f32) = input[index..][0..16].*;
+        const rhs1: @Vector(16, f32) = input[index + 16 ..][0..16].*;
+        acc0 += q0 * rhs0;
+        acc1 += q1 * rhs1;
+    }
+    return @reduce(.Add, acc0 + acc1) * scale;
+}
+
 pub fn dotQ4Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
+    return switch (input.len) {
+        tensor_store.handwritten_hidden_width => dotQ4RowFixed(tensor_store.handwritten_hidden_width, bytes, row_offset, input),
+        tensor_store.handwritten_intermediate_width => dotQ4RowFixed(tensor_store.handwritten_intermediate_width, bytes, row_offset, input),
+        else => dotQ4RowGeneric(bytes, row_offset, input),
+    };
+}
+
+fn dotQ4RowGeneric(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     const start = @as(usize, @intCast(row_offset));
     const scale_bits = std.mem.readInt(u32, bytes[start .. start + 4][0..4], .little);
     const scale: f32 = @bitCast(scale_bits);
@@ -927,6 +981,110 @@ pub fn dotQ4Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
         sum += @as(f32, @floatFromInt(q)) * input[index];
     }
     return sum * scale;
+}
+
+fn dotQ4RowFixed(comptime cols: usize, bytes: []const u8, row_offset: u64, input: []const f32) f32 {
+    std.debug.assert(input.len == cols);
+
+    const start = @as(usize, @intCast(row_offset));
+    const scale_bits = std.mem.readInt(u32, bytes[start .. start + 4][0..4], .little);
+    const scale: f32 = @bitCast(scale_bits);
+    const payload = bytes[start + 4 ..];
+
+    var sum: f32 = 0.0;
+    var index: usize = 0;
+    while (index < cols) : (index += 16) {
+        var low_arr: [8]f32 = undefined;
+        var high_arr: [8]f32 = undefined;
+        var low_rhs_arr: [8]f32 = undefined;
+        var high_rhs_arr: [8]f32 = undefined;
+        inline for (0..8) |lane| {
+            const packed_byte = payload[index / 2 + lane];
+            const low_nibble = packed_byte & 0x0F;
+            const high_nibble = packed_byte >> 4;
+            low_arr[lane] = @floatFromInt(@as(i8, @intCast(@as(i16, low_nibble) - 8)));
+            high_arr[lane] = @floatFromInt(@as(i8, @intCast(@as(i16, high_nibble) - 8)));
+            low_rhs_arr[lane] = input[index + lane * 2];
+            high_rhs_arr[lane] = input[index + lane * 2 + 1];
+        }
+        const low: @Vector(8, f32) = low_arr;
+        const high: @Vector(8, f32) = high_arr;
+        const low_rhs: @Vector(8, f32) = low_rhs_arr;
+        const high_rhs: @Vector(8, f32) = high_rhs_arr;
+        sum += @reduce(.Add, low * low_rhs) + @reduce(.Add, high * high_rhs);
+    }
+    return sum * scale;
+}
+
+fn loadQ8Vector16(bytes: []const u8, start: usize) @Vector(16, f32) {
+    var values: [16]f32 = undefined;
+    inline for (0..16) |lane| {
+        const q: i8 = @bitCast(bytes[start + lane]);
+        values[lane] = @floatFromInt(q);
+    }
+    return values;
+}
+
+fn loadQ6Vector8(bytes: []const u8, start: usize) @Vector(8, f32) {
+    const packed24_a = @as(u32, bytes[start]) |
+        (@as(u32, bytes[start + 1]) << 8) |
+        (@as(u32, bytes[start + 2]) << 16);
+    const packed24_b = @as(u32, bytes[start + 3]) |
+        (@as(u32, bytes[start + 4]) << 8) |
+        (@as(u32, bytes[start + 5]) << 16);
+
+    var values: [8]f32 = undefined;
+    inline for (0..4) |lane| {
+        const encoded: u8 = @intCast((packed24_a >> (lane * 6)) & 0x3F);
+        values[lane] = @floatFromInt(@as(i32, encoded) - 32);
+    }
+    inline for (0..4) |lane| {
+        const encoded: u8 = @intCast((packed24_b >> (lane * 6)) & 0x3F);
+        values[4 + lane] = @floatFromInt(@as(i32, encoded) - 32);
+    }
+    return values;
+}
+
+test "wide quantized handwritten kernels match generic path" {
+    const testing = std.testing;
+
+    inline for (.{ tensor_store.handwritten_hidden_width, tensor_store.handwritten_intermediate_width }) |cols| {
+        const values = try testing.allocator.alloc(f32, cols);
+        defer testing.allocator.free(values);
+        const input = try testing.allocator.alloc(f32, cols);
+        defer testing.allocator.free(input);
+        const row_q8 = try testing.allocator.alloc(u8, 4 + cols);
+        defer testing.allocator.free(row_q8);
+        const row_q6 = try testing.allocator.alloc(u8, 4 + (try std.math.divCeil(usize, cols * 6, 8)));
+        defer testing.allocator.free(row_q6);
+        const row_q4 = try testing.allocator.alloc(u8, 4 + (try std.math.divCeil(usize, cols, 2)));
+        defer testing.allocator.free(row_q4);
+
+        for (values, 0..) |*value, idx| {
+            value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 17 + 5) % 41)) - 20)) / 9.0;
+            input[idx] = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 9 + 7) % 37)) - 18)) / 8.0;
+        }
+
+        encodeQ8Row(row_q8, values);
+        encodeQ6Row(row_q6, values);
+        encodeQ4Row(row_q4, values);
+
+        try testing.expectApproxEqAbs(
+            dotQ8RowGeneric(row_q8, 0, input),
+            dotQ8Row(row_q8, 0, input),
+            1e-6,
+        );
+        try testing.expectApproxEqAbs(
+            dotQ6RowGeneric(row_q6, 0, input),
+            dotQ6Row(row_q6, 0, input),
+            1e-6,
+        );
+        try testing.expectApproxEqAbs(
+            dotQ4RowGeneric(row_q4, 0, input),
+            dotQ4Row(row_q4, 0, input),
+            1e-6,
+        );
+    }
 }
 
 test "quantized q8 row roundtrip and dot" {

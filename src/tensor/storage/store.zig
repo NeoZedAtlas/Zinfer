@@ -360,20 +360,29 @@ fn shouldParallelize(rows: usize, cols: usize, thread_count: usize, has_parallel
     return work >= 1_000_000;
 }
 
+pub const handwritten_hidden_width: usize = 1024;
+pub const handwritten_intermediate_width: usize = 3072;
+
 pub fn dotF32Row(row: []const u8, input: []const f32) f32 {
+    return switch (input.len) {
+        handwritten_hidden_width => dotF32RowFixed(handwritten_hidden_width, row, input),
+        handwritten_intermediate_width => dotF32RowFixed(handwritten_intermediate_width, row, input),
+        else => dotF32RowGeneric(row, input),
+    };
+}
+
+fn dotF32RowGeneric(row: []const u8, input: []const f32) f32 {
     var sum: f32 = 0.0;
     var index: usize = 0;
     while (index + 16 <= input.len) : (index += 16) {
         var lhs_arr: [16]f32 = undefined;
-        var rhs_arr: [16]f32 = undefined;
         inline for (0..16) |lane| {
             const offset = (index + lane) * 4;
             const raw = std.mem.readInt(u32, row[offset .. offset + 4][0..4], .little);
             lhs_arr[lane] = @bitCast(raw);
-            rhs_arr[lane] = input[index + lane];
         }
         const lhs: @Vector(16, f32) = lhs_arr;
-        const rhs: @Vector(16, f32) = rhs_arr;
+        const rhs: @Vector(16, f32) = input[index..][0..16].*;
         sum += @reduce(.Add, lhs * rhs);
     }
     while (index < input.len) : (index += 1) {
@@ -384,20 +393,44 @@ pub fn dotF32Row(row: []const u8, input: []const f32) f32 {
     return sum;
 }
 
+fn dotF32RowFixed(comptime cols: usize, row: []const u8, input: []const f32) f32 {
+    std.debug.assert(input.len == cols);
+    std.debug.assert(row.len == cols * 4);
+
+    var acc0: @Vector(16, f32) = @splat(0.0);
+    var acc1: @Vector(16, f32) = @splat(0.0);
+    var index: usize = 0;
+    while (index < cols) : (index += 32) {
+        const lhs0 = loadF32Vector16(row, index * 4);
+        const lhs1 = loadF32Vector16(row, (index + 16) * 4);
+        const rhs0: @Vector(16, f32) = input[index..][0..16].*;
+        const rhs1: @Vector(16, f32) = input[index + 16 ..][0..16].*;
+        acc0 += lhs0 * rhs0;
+        acc1 += lhs1 * rhs1;
+    }
+    return @reduce(.Add, acc0 + acc1);
+}
+
 pub fn dotBf16Row(row: []const u8, input: []const f32) f32 {
+    return switch (input.len) {
+        handwritten_hidden_width => dotBf16RowFixed(handwritten_hidden_width, row, input),
+        handwritten_intermediate_width => dotBf16RowFixed(handwritten_intermediate_width, row, input),
+        else => dotBf16RowGeneric(row, input),
+    };
+}
+
+fn dotBf16RowGeneric(row: []const u8, input: []const f32) f32 {
     var sum: f32 = 0.0;
     var index: usize = 0;
     while (index + 16 <= input.len) : (index += 16) {
         var lhs_arr: [16]f32 = undefined;
-        var rhs_arr: [16]f32 = undefined;
         inline for (0..16) |lane| {
             const offset = (index + lane) * 2;
             const bits = std.mem.readInt(u16, row[offset .. offset + 2][0..2], .little);
             lhs_arr[lane] = bfloat16.toF32(bits);
-            rhs_arr[lane] = input[index + lane];
         }
         const lhs: @Vector(16, f32) = lhs_arr;
-        const rhs: @Vector(16, f32) = rhs_arr;
+        const rhs: @Vector(16, f32) = input[index..][0..16].*;
         sum += @reduce(.Add, lhs * rhs);
     }
     while (index < input.len) : (index += 1) {
@@ -406,6 +439,86 @@ pub fn dotBf16Row(row: []const u8, input: []const f32) f32 {
         sum += bfloat16.toF32(bits) * input[index];
     }
     return sum;
+}
+
+fn dotBf16RowFixed(comptime cols: usize, row: []const u8, input: []const f32) f32 {
+    std.debug.assert(input.len == cols);
+    std.debug.assert(row.len == cols * 2);
+
+    var acc0: @Vector(16, f32) = @splat(0.0);
+    var acc1: @Vector(16, f32) = @splat(0.0);
+    var index: usize = 0;
+    while (index < cols) : (index += 32) {
+        const lhs0 = loadBf16Vector16(row, index * 2);
+        const lhs1 = loadBf16Vector16(row, (index + 16) * 2);
+        const rhs0: @Vector(16, f32) = input[index..][0..16].*;
+        const rhs1: @Vector(16, f32) = input[index + 16 ..][0..16].*;
+        acc0 += lhs0 * rhs0;
+        acc1 += lhs1 * rhs1;
+    }
+    return @reduce(.Add, acc0 + acc1);
+}
+
+fn loadF32Vector16(bytes: []const u8, byte_offset: usize) @Vector(16, f32) {
+    var values: [16]f32 = undefined;
+    inline for (0..16) |lane| {
+        const offset = byte_offset + lane * 4;
+        const raw = std.mem.readInt(u32, bytes[offset .. offset + 4][0..4], .little);
+        values[lane] = @bitCast(raw);
+    }
+    return values;
+}
+
+fn loadBf16Vector16(bytes: []const u8, byte_offset: usize) @Vector(16, f32) {
+    var values: [16]f32 = undefined;
+    inline for (0..16) |lane| {
+        const offset = byte_offset + lane * 2;
+        const bits = std.mem.readInt(u16, bytes[offset .. offset + 2][0..2], .little);
+        values[lane] = bfloat16.toF32(bits);
+    }
+    return values;
+}
+
+test "wide handwritten f32 row kernel matches generic path" {
+    const testing = std.testing;
+
+    inline for (.{ handwritten_hidden_width, handwritten_intermediate_width }) |cols| {
+        const row = try testing.allocator.alloc(u8, cols * 4);
+        defer testing.allocator.free(row);
+        const input = try testing.allocator.alloc(f32, cols);
+        defer testing.allocator.free(input);
+
+        for (input, 0..) |*value, idx| {
+            value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7) % 23)) - 11)) / 5.0;
+            const weight = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13 + 3) % 29)) - 14)) / 7.0;
+            std.mem.writeInt(u32, row[idx * 4 .. idx * 4 + 4][0..4], @bitCast(weight), .little);
+        }
+
+        const generic = dotF32RowGeneric(row, input);
+        const handwritten = dotF32Row(row, input);
+        try testing.expectApproxEqAbs(generic, handwritten, 3e-5);
+    }
+}
+
+test "wide handwritten bf16 row kernel matches generic path" {
+    const testing = std.testing;
+
+    inline for (.{ handwritten_hidden_width, handwritten_intermediate_width }) |cols| {
+        const row = try testing.allocator.alloc(u8, cols * 2);
+        defer testing.allocator.free(row);
+        const input = try testing.allocator.alloc(f32, cols);
+        defer testing.allocator.free(input);
+
+        for (input, 0..) |*value, idx| {
+            value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 5) % 19)) - 9)) / 4.0;
+            const weight = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11 + 1) % 31)) - 15)) / 6.0;
+            std.mem.writeInt(u16, row[idx * 2 .. idx * 2 + 2][0..2], bfloat16.fromF32(weight), .little);
+        }
+
+        const generic = dotBf16RowGeneric(row, input);
+        const handwritten = dotBf16Row(row, input);
+        try testing.expectApproxEqAbs(generic, handwritten, 1e-6);
+    }
 }
 
 test "tensor store reads a synthetic bf16 tensor" {
