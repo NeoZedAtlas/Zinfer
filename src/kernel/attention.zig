@@ -343,60 +343,85 @@ pub fn scaledDotProductAttentionSingleQueryQ8Cache(
 
 fn dotQ8GroupedSlice(lhs: []const f32, rhs_q8: []const i8, scales: []const u16) f32 {
     std.debug.assert(lhs.len == rhs_q8.len);
+    if (lhs.len == scales.len * q8_cache_group_size) {
+        return dotQ8GroupedSliceExact(lhs, rhs_q8, scales);
+    }
 
     var sum: f32 = 0.0;
-    var group_idx: usize = 0;
     var index: usize = 0;
-    while (index < lhs.len) : ({
-        index += q8_cache_group_size;
-        group_idx += 1;
-    }) {
+    for (scales) |scale_bits| {
+        if (index >= lhs.len) break;
         const end = @min(lhs.len, index + q8_cache_group_size);
-        const scale = bfloat16.toF32(scales[group_idx]);
-        var local: f32 = 0.0;
-        var local_index = index;
-        while (local_index + 16 <= end) : (local_index += 16) {
-            const lhs_vec: @Vector(16, f32) = lhs[local_index..][0..16].*;
-            var rhs_arr: [16]f32 = undefined;
-            inline for (0..16) |lane| {
-                rhs_arr[lane] = @floatFromInt(rhs_q8[local_index + lane]);
+        const scale = bfloat16.toF32(scale_bits);
+        if (end - index == 16) {
+            const lhs_vec: @Vector(16, f32) = lhs[index..][0..16].*;
+            const rhs_i8: @Vector(16, i8) = rhs_q8[index..][0..16].*;
+            const rhs_vec: @Vector(16, f32) = @floatFromInt(rhs_i8);
+            sum += @reduce(.Add, lhs_vec * rhs_vec) * scale;
+        } else {
+            var local: f32 = 0.0;
+            var local_index = index;
+            while (local_index < end) : (local_index += 1) {
+                local += lhs[local_index] * @as(f32, @floatFromInt(rhs_q8[local_index]));
             }
-            const rhs_vec: @Vector(16, f32) = rhs_arr;
-            local += @reduce(.Add, lhs_vec * rhs_vec);
+            sum += local * scale;
         }
-        while (local_index < end) : (local_index += 1) {
-            local += lhs[local_index] * @as(f32, @floatFromInt(rhs_q8[local_index]));
-        }
-        sum += local * scale;
+        index = end;
     }
     return sum;
 }
 
 fn axpyQ8GroupedSliceInPlace(output: []f32, alpha: f32, input_q8: []const i8, scales: []const u16) void {
     std.debug.assert(output.len == input_q8.len);
+    if (output.len == scales.len * q8_cache_group_size) {
+        axpyQ8GroupedSliceExactInPlace(output, alpha, input_q8, scales);
+        return;
+    }
 
-    var group_idx: usize = 0;
     var index: usize = 0;
-    while (index < output.len) : ({
-        index += q8_cache_group_size;
-        group_idx += 1;
-    }) {
+    for (scales) |scale_bits| {
+        if (index >= output.len) break;
         const end = @min(output.len, index + q8_cache_group_size);
-        const scaled_alpha = alpha * bfloat16.toF32(scales[group_idx]);
-        const alpha_vec: @Vector(16, f32) = @splat(scaled_alpha);
-        var local_index = index;
-        while (local_index + 16 <= end) : (local_index += 16) {
-            const out_vec: @Vector(16, f32) = output[local_index..][0..16].*;
-            var in_arr: [16]f32 = undefined;
-            inline for (0..16) |lane| {
-                in_arr[lane] = @floatFromInt(input_q8[local_index + lane]);
+        const scaled_alpha = alpha * bfloat16.toF32(scale_bits);
+        if (end - index == 16) {
+            const alpha_vec: @Vector(16, f32) = @splat(scaled_alpha);
+            const out_vec: @Vector(16, f32) = output[index..][0..16].*;
+            const in_i8: @Vector(16, i8) = input_q8[index..][0..16].*;
+            const in_vec: @Vector(16, f32) = @floatFromInt(in_i8);
+            output[index..][0..16].* = out_vec + alpha_vec * in_vec;
+        } else {
+            var local_index = index;
+            while (local_index < end) : (local_index += 1) {
+                output[local_index] += scaled_alpha * @as(f32, @floatFromInt(input_q8[local_index]));
             }
-            const in_vec: @Vector(16, f32) = in_arr;
-            output[local_index..][0..16].* = out_vec + alpha_vec * in_vec;
         }
-        while (local_index < end) : (local_index += 1) {
-            output[local_index] += scaled_alpha * @as(f32, @floatFromInt(input_q8[local_index]));
-        }
+        index = end;
+    }
+}
+
+fn dotQ8GroupedSliceExact(lhs: []const f32, rhs_q8: []const i8, scales: []const u16) f32 {
+    var sum: f32 = 0.0;
+    var index: usize = 0;
+    for (scales) |scale_bits| {
+        const scale = bfloat16.toF32(scale_bits);
+        const lhs_vec: @Vector(16, f32) = lhs[index..][0..16].*;
+        const rhs_i8: @Vector(16, i8) = rhs_q8[index..][0..16].*;
+        const rhs_vec: @Vector(16, f32) = @floatFromInt(rhs_i8);
+        sum += @reduce(.Add, lhs_vec * rhs_vec) * scale;
+        index += 16;
+    }
+    return sum;
+}
+
+fn axpyQ8GroupedSliceExactInPlace(output: []f32, alpha: f32, input_q8: []const i8, scales: []const u16) void {
+    var index: usize = 0;
+    for (scales) |scale_bits| {
+        const alpha_vec: @Vector(16, f32) = @splat(alpha * bfloat16.toF32(scale_bits));
+        const out_vec: @Vector(16, f32) = output[index..][0..16].*;
+        const in_i8: @Vector(16, i8) = input_q8[index..][0..16].*;
+        const in_vec: @Vector(16, f32) = @floatFromInt(in_i8);
+        output[index..][0..16].* = out_vec + alpha_vec * in_vec;
+        index += 16;
     }
 }
 
