@@ -755,21 +755,18 @@ fn dotQ6Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
             (@as(u32, payload[payload_index + 5]) << 16);
 
         var q_arr: [8]f32 = undefined;
-        var rhs_arr: [8]f32 = undefined;
         inline for (0..4) |lane| {
             const encoded: u8 = @intCast((packed24_a >> (lane * 6)) & 0x3F);
             const q: i32 = @as(i32, encoded) - 32;
             q_arr[lane] = @floatFromInt(q);
-            rhs_arr[lane] = input[index + lane];
         }
         inline for (0..4) |lane| {
             const encoded: u8 = @intCast((packed24_b >> (lane * 6)) & 0x3F);
             const q: i32 = @as(i32, encoded) - 32;
             q_arr[4 + lane] = @floatFromInt(q);
-            rhs_arr[4 + lane] = input[index + 4 + lane];
         }
         const qv: @Vector(8, f32) = q_arr;
-        const rhs: @Vector(8, f32) = rhs_arr;
+        const rhs: @Vector(8, f32) = input[index..][0..8].*;
         sum += @reduce(.Add, qv * rhs);
     }
     while (index + 4 <= input.len) : ({
@@ -781,15 +778,13 @@ fn dotQ6Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
             (@as(u32, payload[payload_index + 2]) << 16);
 
         var q_arr: [4]f32 = undefined;
-        var rhs_arr: [4]f32 = undefined;
         inline for (0..4) |lane| {
             const encoded: u8 = @intCast((packed24 >> (lane * 6)) & 0x3F);
             const q: i32 = @as(i32, encoded) - 32;
             q_arr[lane] = @floatFromInt(q);
-            rhs_arr[lane] = input[index + lane];
         }
         const qv: @Vector(4, f32) = q_arr;
-        const rhs: @Vector(4, f32) = rhs_arr;
+        const rhs: @Vector(4, f32) = input[index..][0..4].*;
         sum += @reduce(.Add, qv * rhs);
     }
     while (index < input.len) : (index += 1) {
@@ -845,15 +840,13 @@ fn dotF32Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     var index: usize = 0;
     while (index + 16 <= input.len) : (index += 16) {
         var lhs_arr: [16]f32 = undefined;
-        var rhs_arr: [16]f32 = undefined;
         inline for (0..16) |lane| {
             const offset = start + (index + lane) * 4;
             const raw = std.mem.readInt(u32, bytes[offset .. offset + 4][0..4], .little);
             lhs_arr[lane] = @bitCast(raw);
-            rhs_arr[lane] = input[index + lane];
         }
         const lhs: @Vector(16, f32) = lhs_arr;
-        const rhs: @Vector(16, f32) = rhs_arr;
+        const rhs: @Vector(16, f32) = input[index..][0..16].*;
         sum += @reduce(.Add, lhs * rhs);
     }
     while (index < input.len) : (index += 1) {
@@ -872,14 +865,12 @@ fn dotQ8Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     var index: usize = 0;
     while (index + 16 <= input.len) : (index += 16) {
         var q_arr: [16]f32 = undefined;
-        var rhs_arr: [16]f32 = undefined;
         inline for (0..16) |lane| {
             const q: i8 = @bitCast(bytes[start + 4 + index + lane]);
             q_arr[lane] = @floatFromInt(q);
-            rhs_arr[lane] = input[index + lane];
         }
         const qv: @Vector(16, f32) = q_arr;
-        const rhs: @Vector(16, f32) = rhs_arr;
+        const rhs: @Vector(16, f32) = input[index..][0..16].*;
         sum += @reduce(.Add, qv * rhs);
     }
     while (index < input.len) : (index += 1) {
