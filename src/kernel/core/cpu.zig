@@ -134,6 +134,19 @@ pub fn silu(x: f32) f32 {
 pub fn swiglu(output: []f32, gate: []const f32, up: []const f32) !void {
     if (output.len != gate.len or gate.len != up.len) return error.SizeMismatch;
 
+    var index: usize = 0;
+    while (index + 16 <= output.len) : (index += 16) {
+        const gate_vec: @Vector(16, f32) = gate[index..][0..16].*;
+        const up_vec: @Vector(16, f32) = up[index..][0..16].*;
+        const silu_vec = gate_vec / (@as(@Vector(16, f32), @splat(1.0)) + @exp(-gate_vec));
+        output[index..][0..16].* = silu_vec * up_vec;
+    }
+    while (index < output.len) : (index += 1) {
+        output[index] = silu(gate[index]) * up[index];
+    }
+}
+
+fn swigluScalarReference(output: []f32, gate: []const f32, up: []const f32) void {
     for (output, gate, up) |*out, gate_value, up_value| {
         out.* = silu(gate_value) * up_value;
     }
@@ -229,6 +242,33 @@ test "swiglu applies silu gate then multiplies up branch" {
     try testing.expectApproxEqAbs(@as(f32, 0.0), output[0], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, 1.4621172), output[1], 1e-6);
     try testing.expectApproxEqAbs(@as(f32, -0.8068243), output[2], 1e-6);
+}
+
+test "wide swiglu matches scalar reference" {
+    const testing = std.testing;
+
+    inline for (.{ 128, 1024, 3072 }) |len| {
+        const gate = try testing.allocator.alloc(f32, len);
+        defer testing.allocator.free(gate);
+        const up = try testing.allocator.alloc(f32, len);
+        defer testing.allocator.free(up);
+        const output = try testing.allocator.alloc(f32, len);
+        defer testing.allocator.free(output);
+        const expected = try testing.allocator.alloc(f32, len);
+        defer testing.allocator.free(expected);
+
+        for (gate, 0..) |*value, idx| {
+            value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13 + 5) % 43)) - 21)) / 8.0;
+            up[idx] = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 9 + 1) % 39)) - 19)) / 7.0;
+        }
+
+        swigluScalarReference(expected, gate, up);
+        try swiglu(output, gate, up);
+
+        for (expected, output) |want, got| {
+            try testing.expectApproxEqAbs(want, got, 1e-6);
+        }
+    }
 }
 
 test "rmsNormRepeated applies same norm weight to multiple slices" {

@@ -121,6 +121,8 @@ pub fn benchHandwrittenOps(
     try stdout.print("\n[rmsnorm]\n", .{});
     try benchRmsNormProfile(allocator, stdout, "hidden", cfg.hidden_size, requested_iterations);
     try benchRmsNormProfile(allocator, stdout, "head", cfg.head_dim, requested_iterations);
+    try stdout.print("\n[swiglu]\n", .{});
+    try benchSwiGluProfile(allocator, stdout, cfg.intermediate_size, requested_iterations);
     try stdout.print("\n[attention-q8-cache]\n", .{});
     try benchAttentionProfile(allocator, stdout, cfg, requested_iterations);
 }
@@ -401,6 +403,46 @@ fn benchAttentionProfile(
     });
 
     try benchAttentionFullProfile(allocator, writer, cfg, seq_len, full_iterations);
+}
+
+fn benchSwiGluProfile(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    width: usize,
+    requested_iterations: usize,
+) !void {
+    const iterations = resolveBenchIterations(requested_iterations, width, 16_000_000);
+
+    const gate = try allocator.alloc(f32, width);
+    defer allocator.free(gate);
+    const up = try allocator.alloc(f32, width);
+    defer allocator.free(up);
+    const output = try allocator.alloc(f32, width);
+    defer allocator.free(output);
+
+    fillSyntheticF32(gate, 149);
+    fillSyntheticF32(up, 167);
+
+    try writer.print("profile: width={d} iterations={d}\n", .{ width, iterations });
+
+    var guard: f32 = 0.0;
+    const warmup = @min(iterations, @as(usize, 8));
+    for (0..warmup) |_| {
+        try cpu.swiglu(output, gate, up);
+        guard += output[0] + output[output.len - 1];
+    }
+    var timer = try std.time.Timer.start();
+    for (0..iterations) |_| {
+        try cpu.swiglu(output, gate, up);
+        guard += output[0] + output[output.len - 1];
+    }
+    const elapsed_ns = timer.read();
+    try writer.print("  kernel=swiglu ns_total={d} ns_iter={d:.3} melem_s={d:.3} guard={d:.6}\n", .{
+        elapsed_ns,
+        nsPerIteration(elapsed_ns, iterations),
+        millionElementsPerSecond(width, iterations, elapsed_ns),
+        guard,
+    });
 }
 
 fn benchRmsNormProfile(
