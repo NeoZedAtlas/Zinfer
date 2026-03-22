@@ -1,5 +1,6 @@
 const std = @import("std");
 const attention = @import("../../kernel/attention/attention.zig");
+const cpu = @import("../../kernel/core/cpu.zig");
 const GenerateOptions = @import("args.zig").GenerateOptions;
 const cli_prompts = @import("prompts.zig");
 const cli_runtime = @import("runtime.zig");
@@ -117,6 +118,9 @@ pub fn benchHandwrittenOps(
     try stdout.print("\n[gemv-row]\n", .{});
     try benchGemvProfile(allocator, stdout, "hidden", cfg.hidden_size, requested_iterations);
     try benchGemvProfile(allocator, stdout, "intermediate", cfg.intermediate_size, requested_iterations);
+    try stdout.print("\n[rmsnorm]\n", .{});
+    try benchRmsNormProfile(allocator, stdout, "hidden", cfg.hidden_size, requested_iterations);
+    try benchRmsNormProfile(allocator, stdout, "head", cfg.head_dim, requested_iterations);
     try stdout.print("\n[attention-q8-cache]\n", .{});
     try benchAttentionProfile(allocator, stdout, cfg, requested_iterations);
 }
@@ -397,6 +401,76 @@ fn benchAttentionProfile(
     });
 
     try benchAttentionFullProfile(allocator, writer, cfg, seq_len, full_iterations);
+}
+
+fn benchRmsNormProfile(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    label: []const u8,
+    width: usize,
+    requested_iterations: usize,
+) !void {
+    const iterations = resolveBenchIterations(requested_iterations, width, 16_000_000);
+    const repeat_count = if (std.mem.eql(u8, label, "head")) @as(usize, 16) else @as(usize, 4);
+
+    const input = try allocator.alloc(f32, width);
+    defer allocator.free(input);
+    const weight = try allocator.alloc(f32, width);
+    defer allocator.free(weight);
+    const output = try allocator.alloc(f32, width);
+    defer allocator.free(output);
+
+    fillSyntheticF32(input, 97);
+    fillSyntheticF32(weight, 113);
+
+    try writer.print("profile: {s} width={d} iterations={d}\n", .{ label, width, iterations });
+
+    var guard: f32 = 0.0;
+    const warmup = @min(iterations, @as(usize, 8));
+    for (0..warmup) |_| {
+        try cpu.rmsNorm(output, input, weight, 1e-5);
+        guard += output[0] + output[output.len - 1];
+    }
+    var timer = try std.time.Timer.start();
+    for (0..iterations) |_| {
+        try cpu.rmsNorm(output, input, weight, 1e-5);
+        guard += output[0] + output[output.len - 1];
+    }
+    const elapsed_ns = timer.read();
+    try writer.print("  kernel=rmsnorm ns_total={d} ns_iter={d:.3} melem_s={d:.3} guard={d:.6}\n", .{
+        elapsed_ns,
+        nsPerIteration(elapsed_ns, iterations),
+        millionElementsPerSecond(width, iterations, elapsed_ns),
+        guard,
+    });
+
+    const repeated_input = try allocator.alloc(f32, width * repeat_count);
+    defer allocator.free(repeated_input);
+    const repeated_output = try allocator.alloc(f32, width * repeat_count);
+    defer allocator.free(repeated_output);
+    fillSyntheticF32(repeated_input, 131);
+
+    guard = 0.0;
+    for (0..warmup) |_| {
+        try cpu.rmsNormRepeated(repeated_output, repeated_input, repeat_count, width, weight, 1e-5);
+        guard += repeated_output[0] + repeated_output[repeated_output.len - 1];
+    }
+    timer = try std.time.Timer.start();
+    for (0..iterations) |_| {
+        try cpu.rmsNormRepeated(repeated_output, repeated_input, repeat_count, width, weight, 1e-5);
+        guard += repeated_output[0] + repeated_output[repeated_output.len - 1];
+    }
+    const repeated_ns = timer.read();
+    try writer.print(
+        "  kernel=rmsnorm_repeated repeats={d} ns_total={d} ns_iter={d:.3} melem_s={d:.3} guard={d:.6}\n",
+        .{
+            repeat_count,
+            repeated_ns,
+            nsPerIteration(repeated_ns, iterations),
+            millionElementsPerSecond(width * repeat_count, iterations, repeated_ns),
+            guard,
+        },
+    );
 }
 
 fn benchAttentionFullProfile(
