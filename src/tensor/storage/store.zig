@@ -1,4 +1,5 @@
 const std = @import("std");
+const kernel_registry = @import("../../kernel/registry.zig");
 const bfloat16 = @import("../formats/bfloat16.zig");
 const parallel_rows = @import("../parallel/parallel_rows.zig");
 const safetensors = @import("../../format/safetensors.zig");
@@ -364,9 +365,9 @@ pub const handwritten_hidden_width: usize = 1024;
 pub const handwritten_intermediate_width: usize = 3072;
 
 pub fn dotF32Row(row: []const u8, input: []const f32) f32 {
-    return switch (input.len) {
-        handwritten_hidden_width => dotF32RowFixed(handwritten_hidden_width, row, input),
-        handwritten_intermediate_width => dotF32RowFixed(handwritten_intermediate_width, row, input),
+    return switch (kernel_registry.resolve(.{ .gemv_row = .{ .op = .f32_row, .cols = input.len } }).shape) {
+        .qwen3_hidden_1024 => dotF32RowFixed(handwritten_hidden_width, row, input),
+        .qwen3_intermediate_3072 => dotF32RowFixed(handwritten_intermediate_width, row, input),
         else => dotF32RowGeneric(row, input),
     };
 }
@@ -412,9 +413,9 @@ fn dotF32RowFixed(comptime cols: usize, row: []const u8, input: []const f32) f32
 }
 
 pub fn dotBf16Row(row: []const u8, input: []const f32) f32 {
-    return switch (input.len) {
-        handwritten_hidden_width => dotBf16RowFixed(handwritten_hidden_width, row, input),
-        handwritten_intermediate_width => dotBf16RowFixed(handwritten_intermediate_width, row, input),
+    return switch (kernel_registry.resolve(.{ .gemv_row = .{ .op = .bf16_row, .cols = input.len } }).shape) {
+        .qwen3_hidden_1024 => dotBf16RowFixed(handwritten_hidden_width, row, input),
+        .qwen3_intermediate_3072 => dotBf16RowFixed(handwritten_intermediate_width, row, input),
         else => dotBf16RowGeneric(row, input),
     };
 }

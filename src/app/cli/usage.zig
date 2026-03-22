@@ -21,6 +21,7 @@ pub fn printUsage() !void {
         \\  zinfer bench [model_dir] <text> <max_new_tokens>
         \\  zinfer bench-ops [iterations]
         \\  zinfer bench-ops [model_dir] [iterations]
+        \\  zinfer bench-suite [model_dir]
         \\  zinfer quantize <q8|q6|q4>
         \\  zinfer quantize <q8|q6|q4> [model_dir]
         \\  zinfer tokenize <text>

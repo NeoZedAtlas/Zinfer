@@ -1,4 +1,5 @@
 const std = @import("std");
+const kernel_registry = @import("../../kernel/registry.zig");
 const safetensors = @import("../../format/safetensors.zig");
 const parallel_rows = @import("../parallel/parallel_rows.zig");
 const tensor_store = @import("../storage/store.zig");
@@ -735,9 +736,9 @@ fn decodeQ4Row(bytes: []const u8, row_offset: u64, output: []f32) void {
 }
 
 pub fn dotQ6Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
-    return switch (input.len) {
-        tensor_store.handwritten_hidden_width => dotQ6RowFixed(tensor_store.handwritten_hidden_width, bytes, row_offset, input),
-        tensor_store.handwritten_intermediate_width => dotQ6RowFixed(tensor_store.handwritten_intermediate_width, bytes, row_offset, input),
+    return switch (kernel_registry.resolve(.{ .gemv_row = .{ .op = .q6_row, .cols = input.len } }).shape) {
+        .qwen3_hidden_1024 => dotQ6RowFixed(tensor_store.handwritten_hidden_width, bytes, row_offset, input),
+        .qwen3_intermediate_3072 => dotQ6RowFixed(tensor_store.handwritten_intermediate_width, bytes, row_offset, input),
         else => dotQ6RowGeneric(bytes, row_offset, input),
     };
 }
@@ -874,9 +875,9 @@ fn dotF32Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
 }
 
 pub fn dotQ8Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
-    return switch (input.len) {
-        tensor_store.handwritten_hidden_width => dotQ8RowFixed(tensor_store.handwritten_hidden_width, bytes, row_offset, input),
-        tensor_store.handwritten_intermediate_width => dotQ8RowFixed(tensor_store.handwritten_intermediate_width, bytes, row_offset, input),
+    return switch (kernel_registry.resolve(.{ .gemv_row = .{ .op = .q8_row, .cols = input.len } }).shape) {
+        .qwen3_hidden_1024 => dotQ8RowFixed(tensor_store.handwritten_hidden_width, bytes, row_offset, input),
+        .qwen3_intermediate_3072 => dotQ8RowFixed(tensor_store.handwritten_intermediate_width, bytes, row_offset, input),
         else => dotQ8RowGeneric(bytes, row_offset, input),
     };
 }
@@ -927,9 +928,9 @@ fn dotQ8RowFixed(comptime cols: usize, bytes: []const u8, row_offset: u64, input
 }
 
 pub fn dotQ4Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
-    return switch (input.len) {
-        tensor_store.handwritten_hidden_width => dotQ4RowFixed(tensor_store.handwritten_hidden_width, bytes, row_offset, input),
-        tensor_store.handwritten_intermediate_width => dotQ4RowFixed(tensor_store.handwritten_intermediate_width, bytes, row_offset, input),
+    return switch (kernel_registry.resolve(.{ .gemv_row = .{ .op = .q4_row, .cols = input.len } }).shape) {
+        .qwen3_hidden_1024 => dotQ4RowFixed(tensor_store.handwritten_hidden_width, bytes, row_offset, input),
+        .qwen3_intermediate_3072 => dotQ4RowFixed(tensor_store.handwritten_intermediate_width, bytes, row_offset, input),
         else => dotQ4RowGeneric(bytes, row_offset, input),
     };
 }

@@ -8,6 +8,7 @@ const cli_token_ids = @import("token_ids.zig");
 const bfloat16 = @import("../../tensor/formats/bfloat16.zig");
 const optimized_kv_cache = @import("../../model/runtime/optimized_kv_cache.zig");
 const decoder_family = @import("../../model/runtime/decoder_family.zig");
+const tensor_backend = @import("../../tensor/backends/backend.zig");
 const quantized = @import("../../tensor/formats/quantized.zig");
 const tensor_store = @import("../../tensor/storage/store.zig");
 
@@ -92,6 +93,50 @@ pub fn benchPrompt(
     try stdout.print("weights_mib: {d:.3}\n", .{bytesToMiB(weights_size)});
     try stdout.print("kv_cache_bytes: {d}\n", .{kv_cache_bytes});
     try stdout.print("kv_cache_mib: {d:.3}\n", .{bytesToMiB(kv_cache_bytes)});
+}
+
+pub fn benchSuite(allocator: std.mem.Allocator, model_dir: []const u8) !void {
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    const profiles = [_]struct {
+        name: []const u8,
+        prompt: []const u8,
+        decode_tokens: usize,
+    }{
+        .{
+            .name = "short",
+            .prompt = "hello",
+            .decode_tokens = 2,
+        },
+        .{
+            .name = "medium",
+            .prompt = "Explain how KV cache layout affects decoder attention throughput in one paragraph.",
+            .decode_tokens = 2,
+        },
+        .{
+            .name = "long",
+            .prompt = "Summarize the main decode hotspots in a small transformer runtime. Focus on attention score accumulation, value accumulation, quantized GEMV, and temporary buffer traffic. Keep the answer technical and compact.",
+            .decode_tokens = 2,
+        },
+    };
+    const backends = [_]tensor_backend.Scheme{ .q6, .q8 };
+
+    try stdout.print("Zinfer perf-gate suite\n", .{});
+    try stdout.print("model_dir: {s}\n", .{model_dir});
+    try stdout.print("threads: 1\n", .{});
+    try stdout.print("kv_cache: auto\n", .{});
+
+    for (profiles) |profile| {
+        for (backends) |backend| {
+            var options = try initBenchSuiteOptions(allocator, profile.decode_tokens, backend);
+            defer options.deinit(allocator);
+
+            try stdout.print(
+                "\n[suite] profile={s} backend={s} decode_tokens={d}\n",
+                .{ profile.name, backend.name(), profile.decode_tokens },
+            );
+            try benchPrompt(allocator, model_dir, profile.prompt, options);
+        }
+    }
 }
 
 pub fn benchHandwrittenOps(
@@ -526,6 +571,8 @@ fn benchAttentionFullProfile(
     const total_query = cfg.num_attention_heads * cfg.head_dim;
     const total_cache = seq_len * cfg.num_key_value_heads * cfg.head_dim;
     const total_scales = seq_len * cfg.num_key_value_heads * scale_groups_per_head;
+    const head_data_stride = seq_len * cfg.head_dim;
+    const head_scale_stride = seq_len * scale_groups_per_head;
 
     const query = try allocator.alloc(f32, total_query);
     defer allocator.free(query);
@@ -533,53 +580,113 @@ fn benchAttentionFullProfile(
     defer allocator.free(output);
     const scores = try allocator.alloc(f32, seq_len);
     defer allocator.free(scores);
-    const key_cache = try allocator.alloc(i8, total_cache);
-    defer allocator.free(key_cache);
-    const value_cache = try allocator.alloc(i8, total_cache);
-    defer allocator.free(value_cache);
-    const key_scales = try allocator.alloc(u16, total_scales);
-    defer allocator.free(key_scales);
-    const value_scales = try allocator.alloc(u16, total_scales);
-    defer allocator.free(value_scales);
+    const key_cache_token_major = try allocator.alloc(i8, total_cache);
+    defer allocator.free(key_cache_token_major);
+    const value_cache_token_major = try allocator.alloc(i8, total_cache);
+    defer allocator.free(value_cache_token_major);
+    const key_scales_token_major = try allocator.alloc(u16, total_scales);
+    defer allocator.free(key_scales_token_major);
+    const value_scales_token_major = try allocator.alloc(u16, total_scales);
+    defer allocator.free(value_scales_token_major);
+    const key_cache_head_major = try allocator.alloc(i8, total_cache);
+    defer allocator.free(key_cache_head_major);
+    const value_cache_head_major = try allocator.alloc(i8, total_cache);
+    defer allocator.free(value_cache_head_major);
+    const key_scales_head_major = try allocator.alloc(u16, total_scales);
+    defer allocator.free(key_scales_head_major);
+    const value_scales_head_major = try allocator.alloc(u16, total_scales);
+    defer allocator.free(value_scales_head_major);
 
     fillSyntheticF32(query, 43);
-    fillSyntheticQ8Cache(key_cache, key_scales, cfg.head_dim, 59);
-    fillSyntheticQ8Cache(value_cache, value_scales, cfg.head_dim, 71);
+    fillSyntheticQ8Cache(key_cache_token_major, key_scales_token_major, cfg.head_dim, 59);
+    fillSyntheticQ8Cache(value_cache_token_major, value_scales_token_major, cfg.head_dim, 71);
+    transposeQ8CacheTokenToHeadMajor(
+        key_cache_head_major,
+        key_scales_head_major,
+        key_cache_token_major,
+        key_scales_token_major,
+        seq_len,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+    );
+    transposeQ8CacheTokenToHeadMajor(
+        value_cache_head_major,
+        value_scales_head_major,
+        value_cache_token_major,
+        value_scales_token_major,
+        seq_len,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+    );
 
     var guard: f32 = 0.0;
     const warmup = @min(iterations, @as(usize, 4));
     for (0..warmup) |_| {
-        try attention.scaledDotProductAttentionSingleQueryQ8Cache(
-            output,
-            query,
-            key_cache,
-            key_scales,
-            value_cache,
-            value_scales,
-            seq_len,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            scores,
-        );
+        switch (optimized_kv_cache.default_q8_layout) {
+            .token_major_legacy => try attention.scaledDotProductAttentionSingleQueryQ8Cache(
+                output,
+                query,
+                key_cache_token_major,
+                key_scales_token_major,
+                value_cache_token_major,
+                value_scales_token_major,
+                seq_len,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                scores,
+            ),
+            .head_major => try attention.scaledDotProductAttentionSingleQueryQ8CacheHeadMajor(
+                output,
+                query,
+                key_cache_head_major,
+                key_scales_head_major,
+                value_cache_head_major,
+                value_scales_head_major,
+                head_data_stride,
+                head_scale_stride,
+                seq_len,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                scores,
+            ),
+        }
         guard += output[0] + output[output.len - 1];
     }
 
     var timer = try std.time.Timer.start();
     for (0..iterations) |_| {
-        try attention.scaledDotProductAttentionSingleQueryQ8Cache(
-            output,
-            query,
-            key_cache,
-            key_scales,
-            value_cache,
-            value_scales,
-            seq_len,
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            scores,
-        );
+        switch (optimized_kv_cache.default_q8_layout) {
+            .token_major_legacy => try attention.scaledDotProductAttentionSingleQueryQ8Cache(
+                output,
+                query,
+                key_cache_token_major,
+                key_scales_token_major,
+                value_cache_token_major,
+                value_scales_token_major,
+                seq_len,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                scores,
+            ),
+            .head_major => try attention.scaledDotProductAttentionSingleQueryQ8CacheHeadMajor(
+                output,
+                query,
+                key_cache_head_major,
+                key_scales_head_major,
+                value_cache_head_major,
+                value_scales_head_major,
+                head_data_stride,
+                head_scale_stride,
+                seq_len,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                scores,
+            ),
+        }
         guard += output[0] + output[output.len - 1];
     }
     const elapsed_ns = timer.read();
@@ -626,6 +733,33 @@ fn benchScalarKernel(
     });
 }
 
+fn initBenchSuiteOptions(
+    allocator: std.mem.Allocator,
+    max_new_tokens: usize,
+    backend_scheme: tensor_backend.Scheme,
+) !GenerateOptions {
+    return .{
+        .max_new_tokens = max_new_tokens,
+        .thinking_mode = .disabled,
+        .system_prompt = null,
+        .sampling = .{
+            .temperature = 0.0,
+            .top_k = 1,
+            .top_p = 1.0,
+            .min_p = 0.0,
+            .presence_penalty = 0.0,
+            .frequency_penalty = 0.0,
+            .repetition_penalty = 1.0,
+        },
+        .seed = 0,
+        .stream_output = false,
+        .stop_sequences = try allocator.alloc([]const u8, 0),
+        .backend_scheme = backend_scheme,
+        .kv_cache_scheme = .auto,
+        .thread_count = 1,
+    };
+}
+
 fn fillSyntheticF32(output: []f32, salt: usize) void {
     for (output, 0..) |*value, idx| {
         const bucket = @as(i32, @intCast((idx * 17 + salt) % 31)) - 15;
@@ -648,6 +782,38 @@ fn fillSyntheticQ8Cache(
         const group_idx = idx % groups_per_head;
         const magnitude = @as(f32, @floatFromInt(@as(u32, @intCast((group_idx + salt) % 13 + 1))));
         scale.* = bfloat16.fromF32(magnitude / 127.0);
+    }
+}
+
+fn transposeQ8CacheTokenToHeadMajor(
+    dst_values: []i8,
+    dst_scales: []u16,
+    src_values: []const i8,
+    src_scales: []const u16,
+    seq_len: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+) void {
+    const groups_per_head = std.math.divCeil(usize, head_dim, attention.q8_cache_group_size) catch unreachable;
+    const head_data_stride = seq_len * head_dim;
+    const head_scale_stride = seq_len * groups_per_head;
+
+    for (0..num_key_value_heads) |head_idx| {
+        for (0..seq_len) |pos| {
+            const token_major_data_start = (pos * num_key_value_heads + head_idx) * head_dim;
+            const token_major_scale_start = (pos * num_key_value_heads + head_idx) * groups_per_head;
+            const head_major_data_start = head_idx * head_data_stride + pos * head_dim;
+            const head_major_scale_start = head_idx * head_scale_stride + pos * groups_per_head;
+
+            @memcpy(
+                dst_values[head_major_data_start .. head_major_data_start + head_dim],
+                src_values[token_major_data_start .. token_major_data_start + head_dim],
+            );
+            @memcpy(
+                dst_scales[head_major_scale_start .. head_major_scale_start + groups_per_head],
+                src_scales[token_major_scale_start .. token_major_scale_start + groups_per_head],
+            );
+        }
     }
 }
 

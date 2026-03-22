@@ -293,17 +293,32 @@ const LayerWeights = struct {
                 cache.len,
                 workspace.scores[0..cache.len],
             ),
-            .q8 => try gqa_attention.forwardProjectedSingleTokenQ8Cache(
-                self.spec.attentionSpec(),
-                workspace.attn_flat,
-                workspace.q_proj,
-                cache.currentQ8Keys(),
-                cache.currentQ8KeyScales(),
-                cache.currentQ8Values(),
-                cache.currentQ8ValueScales(),
-                cache.len,
-                workspace.scores[0..cache.len],
-            ),
+            .q8 => switch (cache.q8_layout) {
+                .token_major_legacy => try gqa_attention.forwardProjectedSingleTokenQ8Cache(
+                    self.spec.attentionSpec(),
+                    workspace.attn_flat,
+                    workspace.q_proj,
+                    cache.currentQ8Keys(),
+                    cache.currentQ8KeyScales(),
+                    cache.currentQ8Values(),
+                    cache.currentQ8ValueScales(),
+                    cache.len,
+                    workspace.scores[0..cache.len],
+                ),
+                .head_major => try gqa_attention.forwardProjectedSingleTokenQ8CacheHeadMajor(
+                    self.spec.attentionSpec(),
+                    workspace.attn_flat,
+                    workspace.q_proj,
+                    cache.q8KeysHeadMajor(),
+                    cache.q8KeyScalesHeadMajor(),
+                    cache.q8ValuesHeadMajor(),
+                    cache.q8ValueScalesHeadMajor(),
+                    cache.q8HeadDataStride(),
+                    cache.q8HeadScaleStride(),
+                    cache.len,
+                    workspace.scores[0..cache.len],
+                ),
+            },
         }
 
         try runtime.backend.matmulVec(workspace.attn_out, self.o_proj_tensor, workspace.attn_flat, runtime.thread_count, &runtime.parallel_pool, workspace.io_scratch);

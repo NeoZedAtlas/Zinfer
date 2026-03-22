@@ -152,6 +152,37 @@ pub fn forwardProjectedSingleTokenQ8Cache(
     );
 }
 
+pub fn forwardProjectedSingleTokenQ8CacheHeadMajor(
+    spec: AttentionSpec,
+    output: []f32,
+    projected_query: []const f32,
+    key_cache: []const i8,
+    key_scales: []const u16,
+    value_cache: []const i8,
+    value_scales: []const u16,
+    data_head_stride: usize,
+    scale_head_stride: usize,
+    seq_len: usize,
+    scores_scratch: []f32,
+) !void {
+    try spec.validate();
+    try attention.scaledDotProductAttentionSingleQueryQ8CacheHeadMajor(
+        output,
+        projected_query,
+        key_cache,
+        key_scales,
+        value_cache,
+        value_scales,
+        data_head_stride,
+        scale_head_stride,
+        seq_len,
+        spec.num_attention_heads,
+        spec.num_key_value_heads,
+        spec.head_dim,
+        scores_scratch,
+    );
+}
+
 test "gqa attention spec validates grouping and dimensions" {
     const testing = std.testing;
 

@@ -23,10 +23,17 @@ pub fn resolveScheme(cache_scheme: Scheme, backend_name: []const u8) Scheme {
 }
 
 pub const q8_group_size: usize = 16;
+pub const Q8Layout = enum {
+    token_major_legacy,
+    head_major,
+};
+
+pub const default_q8_layout: Q8Layout = .head_major;
 
 pub const LayerKVCache = struct {
     allocator: std.mem.Allocator,
     scheme: Scheme,
+    q8_layout: Q8Layout,
     max_seq_len: usize,
     num_key_value_heads: usize,
     head_dim: usize,
@@ -71,6 +78,7 @@ pub const LayerKVCache = struct {
         return .{
             .allocator = allocator,
             .scheme = scheme,
+            .q8_layout = default_q8_layout,
             .max_seq_len = max_seq_len,
             .num_key_value_heads = num_key_value_heads,
             .head_dim = head_dim,
@@ -119,22 +127,58 @@ pub const LayerKVCache = struct {
 
     pub fn currentQ8Keys(self: *const LayerKVCache) []const i8 {
         std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .token_major_legacy);
         return self.keys_q8[0 .. self.len * self.numKeyValueElementsPerToken()];
     }
 
     pub fn currentQ8Values(self: *const LayerKVCache) []const i8 {
         std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .token_major_legacy);
         return self.values_q8[0 .. self.len * self.numKeyValueElementsPerToken()];
     }
 
     pub fn currentQ8KeyScales(self: *const LayerKVCache) []const u16 {
         std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .token_major_legacy);
         return self.key_scales_q8[0 .. self.len * self.scaleGroupsPerToken()];
     }
 
     pub fn currentQ8ValueScales(self: *const LayerKVCache) []const u16 {
         std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .token_major_legacy);
         return self.value_scales_q8[0 .. self.len * self.scaleGroupsPerToken()];
+    }
+
+    pub fn q8KeysHeadMajor(self: *const LayerKVCache) []const i8 {
+        std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .head_major);
+        return self.keys_q8;
+    }
+
+    pub fn q8ValuesHeadMajor(self: *const LayerKVCache) []const i8 {
+        std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .head_major);
+        return self.values_q8;
+    }
+
+    pub fn q8KeyScalesHeadMajor(self: *const LayerKVCache) []const u16 {
+        std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .head_major);
+        return self.key_scales_q8;
+    }
+
+    pub fn q8ValueScalesHeadMajor(self: *const LayerKVCache) []const u16 {
+        std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .head_major);
+        return self.value_scales_q8;
+    }
+
+    pub fn q8HeadDataStride(self: *const LayerKVCache) usize {
+        return self.max_seq_len * self.head_dim;
+    }
+
+    pub fn q8HeadScaleStride(self: *const LayerKVCache) usize {
+        return self.max_seq_len * self.scaleGroupsPerHead();
     }
 
     pub fn numKeyValueElementsPerToken(self: *const LayerKVCache) usize {
@@ -160,6 +204,13 @@ pub const LayerKVCache = struct {
     }
 
     fn appendQ8(self: *LayerKVCache, key: []const f32, value: []const f32) void {
+        switch (self.q8_layout) {
+            .token_major_legacy => self.appendQ8TokenMajor(key, value),
+            .head_major => self.appendQ8HeadMajor(key, value),
+        }
+    }
+
+    fn appendQ8TokenMajor(self: *LayerKVCache, key: []const f32, value: []const f32) void {
         const token_start = self.len * self.numKeyValueElementsPerToken();
         const scale_start = self.len * self.scaleGroupsPerToken();
         const scale_groups_per_head = self.scaleGroupsPerHead();
@@ -180,6 +231,35 @@ pub const LayerKVCache = struct {
                     key_slice[group_start..group_end],
                 );
                 self.value_scales_q8[head_scale_start + group_idx] = quantizeQ8Slice(
+                    value_out[group_start..group_end],
+                    value_slice[group_start..group_end],
+                );
+            }
+        }
+    }
+
+    fn appendQ8HeadMajor(self: *LayerKVCache, key: []const f32, value: []const f32) void {
+        const scale_groups_per_head = self.scaleGroupsPerHead();
+        const head_data_stride = self.q8HeadDataStride();
+        const head_scale_stride = self.q8HeadScaleStride();
+
+        for (0..self.num_key_value_heads) |head_idx| {
+            const head_start = head_idx * self.head_dim;
+            const key_slice = key[head_start .. head_start + self.head_dim];
+            const value_slice = value[head_start .. head_start + self.head_dim];
+            const token_data_start = head_idx * head_data_stride + self.len * self.head_dim;
+            const token_scale_start = head_idx * head_scale_stride + self.len * scale_groups_per_head;
+            const key_out = self.keys_q8[token_data_start .. token_data_start + self.head_dim];
+            const value_out = self.values_q8[token_data_start .. token_data_start + self.head_dim];
+
+            for (0..scale_groups_per_head) |group_idx| {
+                const group_start = group_idx * q8_group_size;
+                const group_end = @min(self.head_dim, group_start + q8_group_size);
+                self.key_scales_q8[token_scale_start + group_idx] = quantizeQ8Slice(
+                    key_out[group_start..group_end],
+                    key_slice[group_start..group_end],
+                );
+                self.value_scales_q8[token_scale_start + group_idx] = quantizeQ8Slice(
                     value_out[group_start..group_end],
                     value_slice[group_start..group_end],
                 );
@@ -311,8 +391,11 @@ test "optimized kv cache stores q8 values with per-head scale" {
     );
 
     try testing.expectEqual(@as(usize, 1), cache.len);
-    try testing.expectEqual(@as(usize, 4), cache.currentQ8Keys().len);
-    try testing.expectEqual(@as(usize, 2), cache.currentQ8KeyScales().len);
-    try testing.expectApproxEqAbs(@as(f32, 2.0 / 127.0), bfloat16.toF32(cache.currentQ8KeyScales()[0]), 1e-3);
-    try testing.expectApproxEqAbs(@as(f32, 0.5 / 127.0), bfloat16.toF32(cache.currentQ8KeyScales()[1]), 1e-3);
+    try testing.expectEqual(Q8Layout.head_major, cache.q8_layout);
+    try testing.expectEqual(@as(usize, 2), cache.q8HeadDataStride());
+    try testing.expectEqual(@as(usize, 1), cache.q8HeadScaleStride());
+    try testing.expectApproxEqAbs(@as(f32, 2.0 / 127.0), bfloat16.toF32(cache.q8KeyScalesHeadMajor()[0]), 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0.5 / 127.0), bfloat16.toF32(cache.q8KeyScalesHeadMajor()[1]), 1e-3);
+    try testing.expectEqual(@as(i8, 64), cache.q8KeysHeadMajor()[0]);
+    try testing.expectEqual(@as(i8, 64), cache.q8KeysHeadMajor()[2]);
 }

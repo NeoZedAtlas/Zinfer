@@ -179,6 +179,12 @@ pub fn run(allocator: std.mem.Allocator) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "bench-suite")) {
+        const model_dir = if (args.len >= 3) args[2] else default_model_dir;
+        try cli_tools.benchSuite(allocator, model_dir);
+        return;
+    }
+
     if (std.mem.eql(u8, command, "quantize")) {
         if (args.len == 3) {
             try cli_tools.quantizeModelDir(allocator, default_model_dir, args[2]);
