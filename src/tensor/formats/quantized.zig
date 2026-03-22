@@ -1198,6 +1198,67 @@ test "quantized store matmulVecByName matches generic q8 rows for hot width" {
     }
 }
 
+test "quantized store matmulVecByName matches generic q6 rows for hot width" {
+    const testing = std.testing;
+    const rows: usize = 3;
+    const cols = tensor_store.handwritten_hidden_width;
+    const row_bytes = 4 + (try std.math.divCeil(usize, cols * 6, 8));
+    const payload_len = rows * row_bytes;
+    const header = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"weight\":{{\"encoding\":\"Q6_0\",\"shape\":[{d},{d}],\"row_bytes\":{d},\"data_offsets\":[0,{d}]}}}}",
+        .{ rows, cols, row_bytes, payload_len },
+    );
+    defer testing.allocator.free(header);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("matmul_q6.zinfer", .{});
+    defer file.close();
+
+    var length_prefix: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length_prefix, header.len, .little);
+    try file.writeAll(&length_prefix);
+    try file.writeAll(header);
+
+    const input = try testing.allocator.alloc(f32, cols);
+    defer testing.allocator.free(input);
+    const row_values = try testing.allocator.alloc(f32, cols);
+    defer testing.allocator.free(row_values);
+    const encoded_row = try testing.allocator.alloc(u8, row_bytes);
+    defer testing.allocator.free(encoded_row);
+
+    for (input, 0..) |*value, idx| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 13 + 9) % 37)) - 18)) / 9.0;
+    }
+
+    for (0..rows) |row_idx| {
+        for (row_values, 0..) |*value, col_idx| {
+            const bucket = @as(i32, @intCast((row_idx * 19 + col_idx * 5 + 7) % 41)) - 20;
+            value.* = @as(f32, @floatFromInt(bucket)) / 8.0;
+        }
+        encodeQ6Row(encoded_row, row_values);
+        try file.writeAll(encoded_row);
+    }
+
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("matmul_q6.zinfer", &path_buffer);
+
+    var store = try Store.open(testing.allocator, path);
+    defer store.deinit();
+
+    const tensor = store.getTensor("weight") orelse return error.TensorNotFound;
+    var output = [_]f32{ 0.0, 0.0, 0.0 };
+    try store.matmulVecByName(&output, "weight", input, 1, null);
+
+    for (0..rows) |row_idx| {
+        const row_offset = tensor.absolute_offset + @as(u64, row_idx) * tensor.row_bytes;
+        const expected = dotQ6RowGeneric(store.bytes, row_offset, input);
+        try testing.expectApproxEqAbs(expected, output[row_idx], 1e-4);
+    }
+}
+
 test "quantized q6 row roundtrip and dot" {
     const testing = std.testing;
     const values = [_]f32{ 1.0, -2.0, 0.5, 3.0 };
