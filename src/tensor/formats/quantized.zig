@@ -1,83 +1,16 @@
 const std = @import("std");
+const codec = @import("quantized/codec.zig");
+const file_impl = @import("quantized/file.zig");
+const types = @import("quantized/types.zig");
 const kernel_registry = @import("../../kernel/registry.zig");
 const safetensors = @import("../../format/safetensors.zig");
 const parallel_rows = @import("../parallel/parallel_rows.zig");
 const tensor_store = @import("../storage/store.zig");
 
-pub const Scheme = enum {
-    q6,
-    q8,
-    q4,
-
-    pub fn name(self: Scheme) []const u8 {
-        return switch (self) {
-            .q6 => "Q6_0",
-            .q8 => "Q8_0",
-            .q4 => "Q4_0",
-        };
-    }
-
-    pub fn fileName(self: Scheme) []const u8 {
-        return switch (self) {
-            .q6 => "model.q6.zinfer",
-            .q8 => "model.q8.zinfer",
-            .q4 => "model.q4.zinfer",
-        };
-    }
-};
-
-pub const Encoding = enum {
-    f32,
-    q6_0,
-    q8_0,
-    q4_0,
-
-    pub fn fromString(text: []const u8) !Encoding {
-        if (std.mem.eql(u8, text, "F32")) return .f32;
-        if (std.mem.eql(u8, text, "Q6_0")) return .q6_0;
-        if (std.mem.eql(u8, text, "Q8_0")) return .q8_0;
-        if (std.mem.eql(u8, text, "Q4_0")) return .q4_0;
-        return error.UnsupportedEncoding;
-    }
-
-    pub fn name(self: Encoding) []const u8 {
-        return switch (self) {
-            .f32 => "F32",
-            .q6_0 => "Q6_0",
-            .q8_0 => "Q8_0",
-            .q4_0 => "Q4_0",
-        };
-    }
-};
-
-pub const TensorInfo = struct {
-    encoding: Encoding,
-    shape: []const u64,
-    row_bytes: u64,
-    data_offsets: [2]u64,
-    absolute_offset: u64,
-
-    pub fn rank(self: TensorInfo) usize {
-        return self.shape.len;
-    }
-};
-
-pub const ParsedFile = struct {
-    arena: std.heap.ArenaAllocator,
-    file_size: u64,
-    header_len: u64,
-    data_start: u64,
-    metadata: std.StringArrayHashMapUnmanaged([]const u8),
-    tensors: std.StringArrayHashMapUnmanaged(TensorInfo),
-
-    pub fn deinit(self: *ParsedFile) void {
-        self.arena.deinit();
-    }
-
-    pub fn getTensor(self: *const ParsedFile, name: []const u8) ?TensorInfo {
-        return self.tensors.get(name);
-    }
-};
+pub const Scheme = types.Scheme;
+pub const Encoding = types.Encoding;
+pub const TensorInfo = types.TensorInfo;
+pub const ParsedFile = types.ParsedFile;
 
 pub const Store = struct {
     allocator: std.mem.Allocator,
@@ -92,7 +25,7 @@ pub const Store = struct {
         } else try std.fs.cwd().readFileAlloc(allocator, path, std.math.maxInt(usize));
         errdefer allocator.free(bytes);
 
-        var parsed = try parseFromBytes(allocator, bytes);
+        var parsed = try file_impl.parseFromBytes(allocator, bytes);
         errdefer parsed.deinit();
 
         return .{
@@ -128,7 +61,7 @@ pub const Store = struct {
         output: []f32,
     ) !void {
         if (tensor.encoding != .f32) return error.UnsupportedEncoding;
-        const total_elements = elementCount(tensor.shape);
+        const total_elements = file_impl.elementCount(tensor.shape);
         if (start_element + output.len > total_elements) return error.ElementRangeOutOfBounds;
         const start = std.math.cast(usize, tensor.absolute_offset + start_element * 4) orelse return error.BufferTooLarge;
         for (output, 0..) |*value, idx| {
@@ -359,108 +292,7 @@ pub fn quantizeModel(
     output_path: []const u8,
     scheme: Scheme,
 ) !void {
-    var store = try tensor_store.TensorStore.open(allocator, input_path);
-    defer store.deinit();
-
-    const temp_path = try std.fmt.allocPrint(allocator, "{s}.tmpdata", .{output_path});
-    defer allocator.free(temp_path);
-
-    const temp_file = if (std.fs.path.isAbsolute(temp_path))
-        try std.fs.createFileAbsolute(temp_path, .{ .truncate = true, .read = true })
-    else
-        try std.fs.cwd().createFile(temp_path, .{ .truncate = true, .read = true });
-    defer temp_file.close();
-
-    var entries = std.ArrayListUnmanaged(QuantizedEntry).empty;
-    defer entries.deinit(allocator);
-
-    const sorted = try sortedSourceTensors(allocator, &store.parsed);
-    defer allocator.free(sorted);
-
-    var current_offset: u64 = 0;
-    for (sorted) |item| {
-        const begin = current_offset;
-        const encoding = selectEncoding(item.name, item.info, scheme);
-
-        const row_bytes: u64 = switch (encoding) {
-            .f32 => 0,
-            .q6_0 => 4 + (std.math.divCeil(u64, item.info.shape[1] * 6, 8) catch return error.InvalidShape),
-            .q8_0 => 4 + item.info.shape[1],
-            .q4_0 => 4 + (std.math.divCeil(u64, item.info.shape[1], 2) catch return error.InvalidShape),
-        };
-
-        if (encoding == .f32) {
-            const count = std.math.cast(usize, try item.info.elementCount()) orelse return error.BufferTooLarge;
-            const values = try store.readElementsAsF32Alloc(item.name, 0, count);
-            defer allocator.free(values);
-            var raw = try allocator.alloc(u8, values.len * 4);
-            defer allocator.free(raw);
-            for (values, 0..) |value, idx| {
-                const offset = idx * 4;
-                std.mem.writeInt(u32, raw[offset .. offset + 4][0..4], @bitCast(value), .little);
-            }
-            try temp_file.writeAll(raw);
-            current_offset += raw.len;
-        } else {
-            const rows = std.math.cast(usize, item.info.shape[0]) orelse return error.DimensionTooLarge;
-            const cols = std.math.cast(usize, item.info.shape[1]) orelse return error.DimensionTooLarge;
-            const input_row_bytes = std.math.cast(usize, item.info.byteLen() / item.info.shape[0]) orelse return error.BufferTooLarge;
-            const row_values = try allocator.alloc(f32, cols);
-            defer allocator.free(row_values);
-            const row_scratch = try allocator.alloc(u8, input_row_bytes);
-            defer allocator.free(row_scratch);
-            const encoded_row = try allocator.alloc(u8, std.math.cast(usize, row_bytes) orelse return error.BufferTooLarge);
-            defer allocator.free(encoded_row);
-
-            for (0..rows) |row_index| {
-                try store.readRowAsF32Into(item.name, row_index, row_values, row_scratch);
-                switch (encoding) {
-                    .q6_0 => encodeQ6Row(encoded_row, row_values),
-                    .q8_0 => encodeQ8Row(encoded_row, row_values),
-                    .q4_0 => encodeQ4Row(encoded_row, row_values),
-                    .f32 => unreachable,
-                }
-                try temp_file.writeAll(encoded_row);
-                current_offset += encoded_row.len;
-            }
-        }
-
-        try entries.append(allocator, .{
-            .name = item.name,
-            .encoding = encoding,
-            .shape = item.info.shape,
-            .row_bytes = row_bytes,
-            .data_offsets = .{ begin, current_offset },
-        });
-    }
-
-    try temp_file.seekTo(0);
-    const header = try buildHeader(allocator, entries.items, scheme);
-    defer allocator.free(header);
-
-    const output_file = if (std.fs.path.isAbsolute(output_path))
-        try std.fs.createFileAbsolute(output_path, .{ .truncate = true })
-    else
-        try std.fs.cwd().createFile(output_path, .{ .truncate = true });
-    defer output_file.close();
-
-    var header_len_bytes: [8]u8 = undefined;
-    std.mem.writeInt(u64, &header_len_bytes, header.len, .little);
-    try output_file.writeAll(&header_len_bytes);
-    try output_file.writeAll(header);
-
-    var copy_buffer: [64 * 1024]u8 = undefined;
-    while (true) {
-        const read = try temp_file.read(&copy_buffer);
-        if (read == 0) break;
-        try output_file.writeAll(copy_buffer[0..read]);
-    }
-
-    if (std.fs.path.isAbsolute(temp_path)) {
-        try std.fs.deleteFileAbsolute(temp_path);
-    } else {
-        try std.fs.cwd().deleteFile(temp_path);
-    }
+    try file_impl.quantizeModel(allocator, input_path, output_path, scheme);
 }
 
 fn selectEncoding(name: []const u8, info: safetensors.TensorInfo, scheme: Scheme) Encoding {
@@ -615,51 +447,15 @@ fn jsonNonNegativeInt(value: std.json.Value) !u64 {
 }
 
 pub fn encodeQ8Row(output: []u8, values: []const f32) void {
-    var max_abs: f32 = 0.0;
-    for (values) |value| max_abs = @max(max_abs, @abs(value));
-    const scale: f32 = if (max_abs == 0.0) 1.0 else max_abs / 127.0;
-    std.mem.writeInt(u32, output[0..4], @bitCast(scale), .little);
-    const inv = 1.0 / scale;
-    for (values, 0..) |value, idx| {
-        const q = std.math.clamp(@as(i32, @intFromFloat(@round(value * inv))), -127, 127);
-        output[4 + idx] = @bitCast(@as(i8, @intCast(q)));
-    }
+    codec.encodeQ8Row(output, values);
 }
 
 pub fn encodeQ6Row(output: []u8, values: []const f32) void {
-    @memset(output[4..], 0);
-    var max_abs: f32 = 0.0;
-    for (values) |value| max_abs = @max(max_abs, @abs(value));
-    const scale: f32 = if (max_abs == 0.0) 1.0 else max_abs / 31.0;
-    std.mem.writeInt(u32, output[0..4], @bitCast(scale), .little);
-    const inv = 1.0 / scale;
-
-    var bit_index: usize = 0;
-    for (values) |value| {
-        const q = std.math.clamp(@as(i32, @intFromFloat(@round(value * inv))), -32, 31);
-        const encoded: u8 = @intCast(q + 32);
-        writePackedBits(output[4..], bit_index, 6, encoded);
-        bit_index += 6;
-    }
+    codec.encodeQ6Row(output, values);
 }
 
 pub fn encodeQ4Row(output: []u8, values: []const f32) void {
-    var max_abs: f32 = 0.0;
-    for (values) |value| max_abs = @max(max_abs, @abs(value));
-    const scale: f32 = if (max_abs == 0.0) 1.0 else max_abs / 7.0;
-    std.mem.writeInt(u32, output[0..4], @bitCast(scale), .little);
-    const inv = 1.0 / scale;
-    @memset(output[4..], 0);
-    for (values, 0..) |value, idx| {
-        const q = std.math.clamp(@as(i32, @intFromFloat(@round(value * inv))), -8, 7);
-        const nibble: u8 = @intCast(q + 8);
-        const byte_index = 4 + idx / 2;
-        if (idx % 2 == 0) {
-            output[byte_index] = nibble;
-        } else {
-            output[byte_index] |= nibble << 4;
-        }
-    }
+    codec.encodeQ4Row(output, values);
 }
 
 fn decodeQ6Row(bytes: []const u8, row_offset: u64, output: []f32) void {
