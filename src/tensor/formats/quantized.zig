@@ -831,6 +831,17 @@ fn dotQ6RowFixed(comptime cols: usize, bytes: []const u8, row_offset: u64, input
     return @reduce(.Add, acc0 + acc1) * scale;
 }
 
+pub fn matmulQ6Rows(output: []f32, bytes: []const u8, row_bytes: usize, input: []const f32) void {
+    std.debug.assert(row_bytes == 4 + (std.math.divCeil(usize, input.len * 6, 8) catch unreachable));
+    std.debug.assert(bytes.len == output.len * row_bytes);
+
+    var row_offset: u64 = 0;
+    for (output) |*value| {
+        value.* = dotQ6Row(bytes, row_offset, input);
+        row_offset += row_bytes;
+    }
+}
+
 fn writePackedBits(buffer: []u8, bit_index: usize, bit_width: u8, value: u8) void {
     var remaining = bit_width;
     var source: u16 = value;
@@ -927,6 +938,17 @@ fn dotQ8RowFixed(comptime cols: usize, bytes: []const u8, row_offset: u64, input
     return @reduce(.Add, acc0 + acc1) * scale;
 }
 
+pub fn matmulQ8Rows(output: []f32, bytes: []const u8, row_bytes: usize, input: []const f32) void {
+    std.debug.assert(row_bytes == 4 + input.len);
+    std.debug.assert(bytes.len == output.len * row_bytes);
+
+    var row_offset: u64 = 0;
+    for (output) |*value| {
+        value.* = dotQ8Row(bytes, row_offset, input);
+        row_offset += row_bytes;
+    }
+}
+
 pub fn dotQ4Row(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
     return switch (kernel_registry.resolve(.{ .gemv_row = .{ .op = .q4_row, .cols = input.len } }).shape) {
         .qwen3_hidden_1024 => dotQ4RowFixed(tensor_store.handwritten_hidden_width, bytes, row_offset, input),
@@ -982,6 +1004,17 @@ fn dotQ4RowGeneric(bytes: []const u8, row_offset: u64, input: []const f32) f32 {
         sum += @as(f32, @floatFromInt(q)) * input[index];
     }
     return sum * scale;
+}
+
+pub fn matmulQ4Rows(output: []f32, bytes: []const u8, row_bytes: usize, input: []const f32) void {
+    std.debug.assert(row_bytes == 4 + (std.math.divCeil(usize, input.len, 2) catch unreachable));
+    std.debug.assert(bytes.len == output.len * row_bytes);
+
+    var row_offset: u64 = 0;
+    for (output) |*value| {
+        value.* = dotQ4Row(bytes, row_offset, input);
+        row_offset += row_bytes;
+    }
 }
 
 fn dotQ4RowFixed(comptime cols: usize, bytes: []const u8, row_offset: u64, input: []const f32) f32 {
@@ -1102,6 +1135,67 @@ test "quantized q8 row roundtrip and dot" {
     const input = [_]f32{ 1.0, 2.0, -1.0, 0.5 };
     const approx = dotQ8Row(&row, 0, &input);
     try testing.expectApproxEqAbs(@as(f32, -2.0), approx, 0.2);
+}
+
+test "quantized store matmulVecByName matches generic q8 rows for hot width" {
+    const testing = std.testing;
+    const rows: usize = 3;
+    const cols = tensor_store.handwritten_hidden_width;
+    const row_bytes = 4 + cols;
+    const payload_len = rows * row_bytes;
+    const header = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"weight\":{{\"encoding\":\"Q8_0\",\"shape\":[{d},{d}],\"row_bytes\":{d},\"data_offsets\":[0,{d}]}}}}",
+        .{ rows, cols, row_bytes, payload_len },
+    );
+    defer testing.allocator.free(header);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const file = try tmp.dir.createFile("matmul_q8.zinfer", .{});
+    defer file.close();
+
+    var length_prefix: [8]u8 = undefined;
+    std.mem.writeInt(u64, &length_prefix, header.len, .little);
+    try file.writeAll(&length_prefix);
+    try file.writeAll(header);
+
+    const input = try testing.allocator.alloc(f32, cols);
+    defer testing.allocator.free(input);
+    const row_values = try testing.allocator.alloc(f32, cols);
+    defer testing.allocator.free(row_values);
+    const encoded_row = try testing.allocator.alloc(u8, row_bytes);
+    defer testing.allocator.free(encoded_row);
+
+    for (input, 0..) |*value, idx| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 11 + 7) % 37)) - 18)) / 9.0;
+    }
+
+    for (0..rows) |row_idx| {
+        for (row_values, 0..) |*value, col_idx| {
+            const bucket = @as(i32, @intCast((row_idx * 23 + col_idx * 7 + 5) % 41)) - 20;
+            value.* = @as(f32, @floatFromInt(bucket)) / 8.0;
+        }
+        encodeQ8Row(encoded_row, row_values);
+        try file.writeAll(encoded_row);
+    }
+
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("matmul_q8.zinfer", &path_buffer);
+
+    var store = try Store.open(testing.allocator, path);
+    defer store.deinit();
+
+    const tensor = store.getTensor("weight") orelse return error.TensorNotFound;
+    var output = [_]f32{ 0.0, 0.0, 0.0 };
+    try store.matmulVecByName(&output, "weight", input, 1, null);
+
+    for (0..rows) |row_idx| {
+        const row_offset = tensor.absolute_offset + @as(u64, row_idx) * tensor.row_bytes;
+        const expected = dotQ8RowGeneric(store.bytes, row_offset, input);
+        try testing.expectApproxEqAbs(expected, output[row_idx], 1e-4);
+    }
 }
 
 test "quantized q6 row roundtrip and dot" {

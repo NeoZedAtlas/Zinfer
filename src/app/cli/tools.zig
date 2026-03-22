@@ -163,6 +163,10 @@ pub fn benchHandwrittenOps(
     try stdout.print("\n[gemv-row]\n", .{});
     try benchGemvProfile(allocator, stdout, "hidden", cfg.hidden_size, requested_iterations);
     try benchGemvProfile(allocator, stdout, "intermediate", cfg.intermediate_size, requested_iterations);
+    try stdout.print("\n[matmul-vec]\n", .{});
+    try benchQuantizedMatmulProfile(allocator, stdout, "attn_proj", cfg.hidden_size, cfg.hidden_size, requested_iterations);
+    try benchQuantizedMatmulProfile(allocator, stdout, "mlp_expand", cfg.intermediate_size, cfg.hidden_size, requested_iterations);
+    try benchQuantizedMatmulProfile(allocator, stdout, "mlp_down", cfg.hidden_size, cfg.intermediate_size, requested_iterations);
     try stdout.print("\n[rmsnorm]\n", .{});
     try benchRmsNormProfile(allocator, stdout, "hidden", cfg.hidden_size, requested_iterations);
     try benchRmsNormProfile(allocator, stdout, "head", cfg.head_dim, requested_iterations);
@@ -729,6 +733,101 @@ fn benchScalarKernel(
         elapsed_ns,
         nsPerIteration(elapsed_ns, iterations),
         millionElementsPerSecond(cols, iterations, elapsed_ns),
+        guard,
+    });
+}
+
+fn benchQuantizedMatmulProfile(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    profile_name: []const u8,
+    rows: usize,
+    cols: usize,
+    requested_iterations: usize,
+) !void {
+    const iterations = resolveBenchIterations(requested_iterations, rows * cols, 24_000_000);
+    const row_bytes_q8 = 4 + cols;
+    const row_bytes_q6 = 4 + (try std.math.divCeil(usize, cols * 6, 8));
+    const row_bytes_q4 = 4 + (try std.math.divCeil(usize, cols, 2));
+
+    const input = try allocator.alloc(f32, cols);
+    defer allocator.free(input);
+    const row_values = try allocator.alloc(f32, cols);
+    defer allocator.free(row_values);
+    const output = try allocator.alloc(f32, rows);
+    defer allocator.free(output);
+    const matrix_q8 = try allocator.alloc(u8, rows * row_bytes_q8);
+    defer allocator.free(matrix_q8);
+    const matrix_q6 = try allocator.alloc(u8, rows * row_bytes_q6);
+    defer allocator.free(matrix_q6);
+    const matrix_q4 = try allocator.alloc(u8, rows * row_bytes_q4);
+    defer allocator.free(matrix_q4);
+
+    fillSyntheticF32(input, 211);
+    for (0..rows) |row_idx| {
+        for (row_values, 0..) |*value, col_idx| {
+            const bucket = @as(i32, @intCast((row_idx * 29 + col_idx * 13 + 5) % 43)) - 21;
+            value.* = @as(f32, @floatFromInt(bucket)) / 9.0;
+        }
+        quantized.encodeQ8Row(matrix_q8[row_idx * row_bytes_q8 .. (row_idx + 1) * row_bytes_q8], row_values);
+        quantized.encodeQ6Row(matrix_q6[row_idx * row_bytes_q6 .. (row_idx + 1) * row_bytes_q6], row_values);
+        quantized.encodeQ4Row(matrix_q4[row_idx * row_bytes_q4 .. (row_idx + 1) * row_bytes_q4], row_values);
+    }
+
+    try writer.print("profile: {s} rows={d} cols={d} iterations={d}\n", .{
+        profile_name,
+        rows,
+        cols,
+        iterations,
+    });
+
+    try benchMatrixKernel(writer, "q8", rows, cols, iterations, struct {
+        fn run(output_buf: []f32, matrix: []const u8, row_bytes: usize, vector: []const f32) void {
+            quantized.matmulQ8Rows(output_buf, matrix, row_bytes, vector);
+        }
+    }.run, output, matrix_q8, row_bytes_q8, input);
+    try benchMatrixKernel(writer, "q6", rows, cols, iterations, struct {
+        fn run(output_buf: []f32, matrix: []const u8, row_bytes: usize, vector: []const f32) void {
+            quantized.matmulQ6Rows(output_buf, matrix, row_bytes, vector);
+        }
+    }.run, output, matrix_q6, row_bytes_q6, input);
+    try benchMatrixKernel(writer, "q4", rows, cols, iterations, struct {
+        fn run(output_buf: []f32, matrix: []const u8, row_bytes: usize, vector: []const f32) void {
+            quantized.matmulQ4Rows(output_buf, matrix, row_bytes, vector);
+        }
+    }.run, output, matrix_q4, row_bytes_q4, input);
+}
+
+fn benchMatrixKernel(
+    writer: anytype,
+    kernel_name: []const u8,
+    rows: usize,
+    cols: usize,
+    iterations: usize,
+    kernel: fn ([]f32, []const u8, usize, []const f32) void,
+    output: []f32,
+    matrix: []const u8,
+    row_bytes: usize,
+    input: []const f32,
+) !void {
+    var guard: f32 = 0.0;
+    const warmup = @min(iterations, @as(usize, 4));
+    for (0..warmup) |_| {
+        kernel(output, matrix, row_bytes, input);
+        guard += output[0] + output[output.len - 1];
+    }
+
+    var timer = try std.time.Timer.start();
+    for (0..iterations) |_| {
+        kernel(output, matrix, row_bytes, input);
+        guard += output[0] + output[output.len - 1];
+    }
+    const elapsed_ns = timer.read();
+    try writer.print("  kernel={s} ns_total={d} ns_iter={d:.3} melem_s={d:.3} guard={d:.6}\n", .{
+        kernel_name,
+        elapsed_ns,
+        nsPerIteration(elapsed_ns, iterations),
+        millionElementsPerSecond(rows * cols, iterations, elapsed_ns),
         guard,
     });
 }
