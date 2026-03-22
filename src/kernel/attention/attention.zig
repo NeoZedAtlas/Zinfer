@@ -3,6 +3,8 @@ const bfloat16 = @import("../../tensor/formats/bfloat16.zig");
 const cpu = @import("../core/cpu.zig");
 
 pub const q8_cache_group_size: usize = 16;
+const handwritten_q8_head_dim: usize = 128;
+const handwritten_q8_scale_groups: usize = handwritten_q8_head_dim / q8_cache_group_size;
 
 pub const RoPETable = struct {
     allocator: std.mem.Allocator,
@@ -301,6 +303,51 @@ pub fn scaledDotProductAttentionSingleQueryQ8Cache(
     if (value_scales.len != seq_len * num_key_value_heads * scale_groups_per_head) return error.SizeMismatch;
     if (scores_scratch.len < seq_len) return error.InsufficientScratchSpace;
 
+    if (head_dim == handwritten_q8_head_dim and scale_groups_per_head == handwritten_q8_scale_groups) {
+        return scaledDotProductAttentionSingleQueryQ8Cache128(
+            output,
+            query,
+            key_cache,
+            key_scales,
+            value_cache,
+            value_scales,
+            seq_len,
+            num_query_heads,
+            num_key_value_heads,
+            scores_scratch,
+        );
+    }
+
+    return scaledDotProductAttentionSingleQueryQ8CacheGeneric(
+        output,
+        query,
+        key_cache,
+        key_scales,
+        value_cache,
+        value_scales,
+        seq_len,
+        num_query_heads,
+        num_key_value_heads,
+        head_dim,
+        scale_groups_per_head,
+        scores_scratch,
+    );
+}
+
+fn scaledDotProductAttentionSingleQueryQ8CacheGeneric(
+    output: []f32,
+    query: []const f32,
+    key_cache: []const i8,
+    key_scales: []const u16,
+    value_cache: []const i8,
+    value_scales: []const u16,
+    seq_len: usize,
+    num_query_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    scale_groups_per_head: usize,
+    scores_scratch: []f32,
+) !void {
     const group_size = num_query_heads / num_key_value_heads;
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
@@ -341,9 +388,62 @@ pub fn scaledDotProductAttentionSingleQueryQ8Cache(
     }
 }
 
+fn scaledDotProductAttentionSingleQueryQ8Cache128(
+    output: []f32,
+    query: []const f32,
+    key_cache: []const i8,
+    key_scales: []const u16,
+    value_cache: []const i8,
+    value_scales: []const u16,
+    seq_len: usize,
+    num_query_heads: usize,
+    num_key_value_heads: usize,
+    scores_scratch: []f32,
+) !void {
+    const head_dim = handwritten_q8_head_dim;
+    const scale_groups_per_head = handwritten_q8_scale_groups;
+    const group_size = num_query_heads / num_key_value_heads;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    @memset(output, 0.0);
+
+    for (0..num_query_heads) |q_head_idx| {
+        const q_start = q_head_idx * head_dim;
+        const q_slice = query[q_start .. q_start + head_dim];
+        const kv_head_idx = q_head_idx / group_size;
+        const scores = scores_scratch[0..seq_len];
+
+        for (0..seq_len) |pos| {
+            const cache_head_index = pos * num_key_value_heads + kv_head_idx;
+            const cache_start = cache_head_index * head_dim;
+            const scale_start = cache_head_index * scale_groups_per_head;
+            scores[pos] = dotQ8GroupedSlice128Exact(
+                q_slice,
+                key_cache[cache_start .. cache_start + head_dim],
+                key_scales[scale_start .. scale_start + scale_groups_per_head],
+            ) * scale;
+        }
+
+        try softmaxInPlace(scores);
+
+        const out_slice = output[q_start .. q_start + head_dim];
+        accumulateQ8ValueHead128(
+            out_slice,
+            scores,
+            value_cache,
+            value_scales,
+            num_key_value_heads,
+            kv_head_idx,
+        );
+    }
+}
+
 pub fn dotQ8GroupedSlice(lhs: []const f32, rhs_q8: []const i8, scales: []const u16) f32 {
     std.debug.assert(lhs.len == rhs_q8.len);
     if (lhs.len == scales.len * q8_cache_group_size) {
+        if (lhs.len == handwritten_q8_head_dim and scales.len == handwritten_q8_scale_groups) {
+            return dotQ8GroupedSlice128Exact(lhs, rhs_q8, scales);
+        }
         return dotQ8GroupedSliceExact(lhs, rhs_q8, scales);
     }
 
@@ -413,6 +513,32 @@ fn dotQ8GroupedSliceExact(lhs: []const f32, rhs_q8: []const i8, scales: []const 
     return sum;
 }
 
+fn dotQ8GroupedSlice128Exact(lhs: []const f32, rhs_q8: []const i8, scales: []const u16) f32 {
+    std.debug.assert(lhs.len == handwritten_q8_head_dim);
+    std.debug.assert(rhs_q8.len == handwritten_q8_head_dim);
+    std.debug.assert(scales.len == handwritten_q8_scale_groups);
+
+    var acc0: @Vector(16, f32) = @splat(0.0);
+    var acc1: @Vector(16, f32) = @splat(0.0);
+    var acc2: @Vector(16, f32) = @splat(0.0);
+    var acc3: @Vector(16, f32) = @splat(0.0);
+    var acc4: @Vector(16, f32) = @splat(0.0);
+    var acc5: @Vector(16, f32) = @splat(0.0);
+    var acc6: @Vector(16, f32) = @splat(0.0);
+    var acc7: @Vector(16, f32) = @splat(0.0);
+
+    acc0 += lhs[0..16].* * scaledQ8Vector16(rhs_q8, 0, bfloat16.toF32(scales[0]));
+    acc1 += lhs[16..32].* * scaledQ8Vector16(rhs_q8, 16, bfloat16.toF32(scales[1]));
+    acc2 += lhs[32..48].* * scaledQ8Vector16(rhs_q8, 32, bfloat16.toF32(scales[2]));
+    acc3 += lhs[48..64].* * scaledQ8Vector16(rhs_q8, 48, bfloat16.toF32(scales[3]));
+    acc4 += lhs[64..80].* * scaledQ8Vector16(rhs_q8, 64, bfloat16.toF32(scales[4]));
+    acc5 += lhs[80..96].* * scaledQ8Vector16(rhs_q8, 80, bfloat16.toF32(scales[5]));
+    acc6 += lhs[96..112].* * scaledQ8Vector16(rhs_q8, 96, bfloat16.toF32(scales[6]));
+    acc7 += lhs[112..128].* * scaledQ8Vector16(rhs_q8, 112, bfloat16.toF32(scales[7]));
+
+    return @reduce(.Add, acc0 + acc1 + acc2 + acc3 + acc4 + acc5 + acc6 + acc7);
+}
+
 fn axpyQ8GroupedSliceExactInPlace(output: []f32, alpha: f32, input_q8: []const i8, scales: []const u16) void {
     var index: usize = 0;
     for (scales) |scale_bits| {
@@ -422,6 +548,123 @@ fn axpyQ8GroupedSliceExactInPlace(output: []f32, alpha: f32, input_q8: []const i
         const in_vec: @Vector(16, f32) = @floatFromInt(in_i8);
         output[index..][0..16].* = out_vec + alpha_vec * in_vec;
         index += 16;
+    }
+}
+
+fn accumulateQ8ValueHead128(
+    output: []f32,
+    scores: []const f32,
+    value_cache: []const i8,
+    value_scales: []const u16,
+    num_key_value_heads: usize,
+    kv_head_idx: usize,
+) void {
+    std.debug.assert(output.len == handwritten_q8_head_dim);
+
+    var acc0: @Vector(16, f32) = @splat(0.0);
+    var acc1: @Vector(16, f32) = @splat(0.0);
+    var acc2: @Vector(16, f32) = @splat(0.0);
+    var acc3: @Vector(16, f32) = @splat(0.0);
+    var acc4: @Vector(16, f32) = @splat(0.0);
+    var acc5: @Vector(16, f32) = @splat(0.0);
+    var acc6: @Vector(16, f32) = @splat(0.0);
+    var acc7: @Vector(16, f32) = @splat(0.0);
+
+    for (scores, 0..) |weight, pos| {
+        const cache_head_index = pos * num_key_value_heads + kv_head_idx;
+        const cache_start = cache_head_index * handwritten_q8_head_dim;
+        const scale_start = cache_head_index * handwritten_q8_scale_groups;
+
+        acc0 += scaledQ8Vector16(value_cache, cache_start + 0, weight * bfloat16.toF32(value_scales[scale_start + 0]));
+        acc1 += scaledQ8Vector16(value_cache, cache_start + 16, weight * bfloat16.toF32(value_scales[scale_start + 1]));
+        acc2 += scaledQ8Vector16(value_cache, cache_start + 32, weight * bfloat16.toF32(value_scales[scale_start + 2]));
+        acc3 += scaledQ8Vector16(value_cache, cache_start + 48, weight * bfloat16.toF32(value_scales[scale_start + 3]));
+        acc4 += scaledQ8Vector16(value_cache, cache_start + 64, weight * bfloat16.toF32(value_scales[scale_start + 4]));
+        acc5 += scaledQ8Vector16(value_cache, cache_start + 80, weight * bfloat16.toF32(value_scales[scale_start + 5]));
+        acc6 += scaledQ8Vector16(value_cache, cache_start + 96, weight * bfloat16.toF32(value_scales[scale_start + 6]));
+        acc7 += scaledQ8Vector16(value_cache, cache_start + 112, weight * bfloat16.toF32(value_scales[scale_start + 7]));
+    }
+
+    output[0..16].* = acc0;
+    output[16..32].* = acc1;
+    output[32..48].* = acc2;
+    output[48..64].* = acc3;
+    output[64..80].* = acc4;
+    output[80..96].* = acc5;
+    output[96..112].* = acc6;
+    output[112..128].* = acc7;
+}
+
+fn scaledQ8Vector16(input_q8: []const i8, start: usize, scale: f32) @Vector(16, f32) {
+    const scale_vec: @Vector(16, f32) = @splat(scale);
+    const input_i8: @Vector(16, i8) = input_q8[start..][0..16].*;
+    const input_f32: @Vector(16, f32) = @floatFromInt(input_i8);
+    return input_f32 * scale_vec;
+}
+
+test "q8 attention handwritten 128 full path matches generic path" {
+    const testing = std.testing;
+
+    const seq_len = 5;
+    const num_query_heads = 4;
+    const num_key_value_heads = 2;
+    const head_dim = handwritten_q8_head_dim;
+    const total_query = num_query_heads * head_dim;
+    const total_cache = seq_len * num_key_value_heads * head_dim;
+    const total_scales = seq_len * num_key_value_heads * handwritten_q8_scale_groups;
+
+    var query: [total_query]f32 = undefined;
+    var key_cache: [total_cache]i8 = undefined;
+    var value_cache: [total_cache]i8 = undefined;
+    var key_scales: [total_scales]u16 = undefined;
+    var value_scales: [total_scales]u16 = undefined;
+    var scores_generic: [seq_len]f32 = undefined;
+    var scores_handwritten: [seq_len]f32 = undefined;
+    var output_generic: [total_query]f32 = undefined;
+    var output_handwritten: [total_query]f32 = undefined;
+
+    for (&query, 0..) |*value, idx| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7 + 3) % 37)) - 18)) / 9.0;
+    }
+    for (&key_cache, 0..) |*value, idx| {
+        value.* = @intCast(@as(i16, @intCast((idx * 11 + 5) % 255)) - 127);
+        value_cache[idx] = @intCast(@as(i16, @intCast((idx * 13 + 9) % 255)) - 127);
+    }
+    for (&key_scales, 0..) |*value, idx| {
+        value.* = bfloat16.fromF32(@as(f32, @floatFromInt((idx % handwritten_q8_scale_groups) + 1)) / 127.0);
+        value_scales[idx] = bfloat16.fromF32(@as(f32, @floatFromInt((idx % handwritten_q8_scale_groups) + 2)) / 127.0);
+    }
+
+    try scaledDotProductAttentionSingleQueryQ8CacheGeneric(
+        &output_generic,
+        &query,
+        &key_cache,
+        &key_scales,
+        &value_cache,
+        &value_scales,
+        seq_len,
+        num_query_heads,
+        num_key_value_heads,
+        head_dim,
+        handwritten_q8_scale_groups,
+        &scores_generic,
+    );
+
+    try scaledDotProductAttentionSingleQueryQ8Cache128(
+        &output_handwritten,
+        &query,
+        &key_cache,
+        &key_scales,
+        &value_cache,
+        &value_scales,
+        seq_len,
+        num_query_heads,
+        num_key_value_heads,
+        &scores_handwritten,
+    );
+
+    for (output_generic, output_handwritten) |expected, actual| {
+        try testing.expectApproxEqAbs(expected, actual, 1e-5);
     }
 }
 
