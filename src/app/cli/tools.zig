@@ -4,7 +4,8 @@ const cpu = @import("../../kernel/core/cpu.zig");
 const GenerateOptions = @import("args.zig").GenerateOptions;
 const cli_prompts = @import("prompts.zig");
 const cli_runtime = @import("runtime.zig");
-const cli_token_ids = @import("token_ids.zig");
+const model_tools = @import("tools/model.zig");
+const text_tools = @import("tools/text.zig");
 const bfloat16 = @import("../../tensor/formats/bfloat16.zig");
 const optimized_kv_cache = @import("../../model/runtime/optimized_kv_cache.zig");
 const decoder_family = @import("../../model/runtime/decoder_family.zig");
@@ -176,117 +177,9 @@ pub fn benchHandwrittenOps(
     try benchAttentionProfile(allocator, stdout, cfg, requested_iterations);
 }
 
-pub fn quantizeModelDir(
-    allocator: std.mem.Allocator,
-    model_dir: []const u8,
-    scheme_text: []const u8,
-) !void {
-    const scheme: quantized.Scheme = if (std.mem.eql(u8, scheme_text, "q8"))
-        .q8
-    else if (std.mem.eql(u8, scheme_text, "q6"))
-        .q6
-    else if (std.mem.eql(u8, scheme_text, "q4"))
-        .q4
-    else
-        return error.InvalidQuantizationScheme;
-
-    const input_path = try std.fs.path.join(allocator, &.{ model_dir, "model.safetensors" });
-    defer allocator.free(input_path);
-    const output_path = try std.fs.path.join(allocator, &.{ model_dir, scheme.fileName() });
-    defer allocator.free(output_path);
-
-    const stdout = std.fs.File.stdout().deprecatedWriter();
-    try stdout.print("Zinfer quantize\n", .{});
-    try stdout.print("model_dir: {s}\n", .{model_dir});
-    try stdout.print("scheme: {s}\n", .{scheme.name()});
-    try stdout.print("output: {s}\n", .{output_path});
-
-    var timer = try std.time.Timer.start();
-    try quantized.quantizeModel(allocator, input_path, output_path, scheme);
-    const elapsed_ns = timer.read();
-    const output_size = try fileSizeAtPath(output_path);
-
-    try stdout.print("elapsed_ms: {d:.3}\n", .{nsToMs(elapsed_ns)});
-    try stdout.print("output_bytes: {d}\n", .{output_size});
-    try stdout.print("output_mib: {d:.3}\n", .{bytesToMiB(output_size)});
-}
-
-pub fn tokenizeText(
-    allocator: std.mem.Allocator,
-    model_dir: []const u8,
-    text: []const u8,
-) !void {
-    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
-    defer allocator.free(config_path);
-
-    var parsed_config = try decoder_family.loadConfigFromFile(allocator, config_path);
-    defer parsed_config.deinit();
-
-    var tokenizer = try decoder_family.loadTokenizerFromModelDir(
-        allocator,
-        parsed_config.value.architecture,
-        model_dir,
-    );
-    defer tokenizer.deinit();
-
-    const ids = try tokenizer.encodeAlloc(allocator, text);
-    defer allocator.free(ids);
-
-    const stdout = std.fs.File.stdout().deprecatedWriter();
-    try stdout.print("Zinfer tokenize\n", .{});
-    try stdout.print("text: {s}\n", .{text});
-    try stdout.print("ids: [", .{});
-    for (ids, 0..) |id, idx| {
-        if (idx != 0) try stdout.print(", ", .{});
-        try stdout.print("{d}", .{id});
-    }
-    try stdout.print("]\n", .{});
-}
-
-pub fn decodeIds(
-    allocator: std.mem.Allocator,
-    model_dir: []const u8,
-    ids_csv: []const u8,
-) !void {
-    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
-    defer allocator.free(config_path);
-
-    var parsed_config = try decoder_family.loadConfigFromFile(allocator, config_path);
-    defer parsed_config.deinit();
-
-    var tokenizer = try decoder_family.loadTokenizerFromModelDir(
-        allocator,
-        parsed_config.value.architecture,
-        model_dir,
-    );
-    defer tokenizer.deinit();
-
-    const ids_usize = try cli_token_ids.parseTokenIdsAlloc(allocator, ids_csv);
-    defer allocator.free(ids_usize);
-    const ids = try allocator.alloc(u32, ids_usize.len);
-    defer allocator.free(ids);
-    for (ids_usize, 0..) |value, idx| {
-        ids[idx] = std.math.cast(u32, value) orelse return error.TokenIdOutOfRange;
-    }
-
-    const text = try tokenizer.decodeAlloc(allocator, ids);
-    defer allocator.free(text);
-
-    const stdout = std.fs.File.stdout().deprecatedWriter();
-    try stdout.print("Zinfer decode\n", .{});
-    try stdout.print("ids: {s}\n", .{ids_csv});
-    try stdout.print("text: {s}\n", .{text});
-}
-
-fn fileSizeAtPath(path: []const u8) !u64 {
-    const file = if (std.fs.path.isAbsolute(path))
-        try std.fs.openFileAbsolute(path, .{})
-    else
-        try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    const stat = try file.stat();
-    return stat.size;
-}
+pub const quantizeModelDir = model_tools.quantizeModelDir;
+pub const tokenizeText = text_tools.tokenizeText;
+pub const decodeIds = text_tools.decodeIds;
 
 fn estimateKvCacheBytes(
     cfg: decoder_family.DecoderConfig,
