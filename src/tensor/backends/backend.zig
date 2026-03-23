@@ -45,10 +45,13 @@ pub const Backend = union(Scheme) {
             .q8 => .{ .q8 = try quantized.Store.open(allocator, q8_path) },
             .bf16 => .{ .bf16 = try tensor_store.TensorStore.open(allocator, bf16_path) },
             .auto => blk: {
-                if (pathExists(q6_path)) break :blk .{ .q6 = try quantized.Store.open(allocator, q6_path) };
-                if (pathExists(q4_path)) break :blk .{ .q4 = try quantized.Store.open(allocator, q4_path) };
-                if (pathExists(q8_path)) break :blk .{ .q8 = try quantized.Store.open(allocator, q8_path) };
-                break :blk .{ .bf16 = try tensor_store.TensorStore.open(allocator, bf16_path) };
+                break :blk switch (resolveAutoScheme(pathExists(q8_path), pathExists(q6_path), pathExists(q4_path))) {
+                    .q8 => .{ .q8 = try quantized.Store.open(allocator, q8_path) },
+                    .q6 => .{ .q6 = try quantized.Store.open(allocator, q6_path) },
+                    .q4 => .{ .q4 = try quantized.Store.open(allocator, q4_path) },
+                    .bf16 => .{ .bf16 = try tensor_store.TensorStore.open(allocator, bf16_path) },
+                    .auto => unreachable,
+                };
             },
         };
     }
@@ -202,4 +205,19 @@ fn pathExists(path: []const u8) bool {
     } else |_| {
         return false;
     }
+}
+
+fn resolveAutoScheme(has_q8: bool, has_q6: bool, has_q4: bool) Scheme {
+    if (has_q8) return .q8;
+    if (has_q6) return .q6;
+    if (has_q4) return .q4;
+    return .bf16;
+}
+
+test "auto backend prefers fastest available quantized artifact" {
+    try std.testing.expectEqual(Scheme.q8, resolveAutoScheme(true, true, true));
+    try std.testing.expectEqual(Scheme.q8, resolveAutoScheme(true, true, false));
+    try std.testing.expectEqual(Scheme.q6, resolveAutoScheme(false, true, true));
+    try std.testing.expectEqual(Scheme.q4, resolveAutoScheme(false, false, true));
+    try std.testing.expectEqual(Scheme.bf16, resolveAutoScheme(false, false, false));
 }
