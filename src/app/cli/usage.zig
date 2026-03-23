@@ -21,6 +21,8 @@ pub fn printUsage() !void {
         \\  zinfer bench [model_dir] <text> <max_new_tokens>
         \\  zinfer bench-batch <text> <batch_size> [max_new_tokens]
         \\  zinfer bench-batch [model_dir] <text> <batch_size> [max_new_tokens]
+        \\  zinfer bench-continuous <text> <batch_size> <total_requests> [max_new_tokens]
+        \\  zinfer bench-continuous [model_dir] <text> <batch_size> <total_requests> [max_new_tokens]
         \\  zinfer bench-ops [iterations]
         \\  zinfer bench-ops [model_dir] [iterations]
         \\  zinfer bench-suite [model_dir]

@@ -173,6 +173,20 @@ pub fn run(allocator: std.mem.Allocator) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "bench-continuous")) {
+        var invocation = try cli_args.parseBenchContinuousInvocation(allocator, args);
+        defer invocation.deinit(allocator);
+        try cli_tools.benchContinuousPrompt(
+            allocator,
+            invocation.model_dir,
+            invocation.user_text,
+            invocation.batch_size,
+            invocation.total_requests,
+            invocation.options,
+        );
+        return;
+    }
+
     if (std.mem.eql(u8, command, "bench-ops")) {
         var model_dir: []const u8 = default_model_dir;
         var iterations: usize = 0;

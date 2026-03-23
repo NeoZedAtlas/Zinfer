@@ -106,6 +106,10 @@ pub const LayerKVCache = struct {
         self.len += 1;
     }
 
+    pub fn reset(self: *LayerKVCache) void {
+        self.len = 0;
+    }
+
     pub fn currentBf16Keys(self: *const LayerKVCache) []const u16 {
         std.debug.assert(self.scheme == .bf16);
         return self.keys_bf16[0 .. self.len * self.numKeyValueElementsPerToken()];
@@ -393,6 +397,10 @@ pub const ModelCache = struct {
         for (self.layers) |*layer| layer.deinit();
         self.allocator.free(self.layers);
     }
+
+    pub fn reset(self: *ModelCache) void {
+        for (self.layers) |*layer| layer.reset();
+    }
 };
 
 pub fn estimateBytes(
@@ -548,4 +556,18 @@ test "optimized kv cache stores q8 paged head-major values by page" {
     try testing.expectEqual(expected_page1_value[0], cache.q8ValuesPagedHeadMajor()[page_stride]);
     try testing.expectEqual(@as(usize, 33), cache.len);
     try testing.expect(head_stride > page_stride);
+}
+
+test "optimized kv cache reset clears logical length without reallocating" {
+    const testing = std.testing;
+
+    var cache = try LayerKVCache.initWithLayout(testing.allocator, 4, 1, 2, .q8, .head_major);
+    defer cache.deinit();
+
+    try cache.append(&[_]f32{ 1.0, 2.0 }, &[_]f32{ 3.0, 4.0 });
+    try testing.expectEqual(@as(usize, 1), cache.len);
+    cache.reset();
+    try testing.expectEqual(@as(usize, 0), cache.len);
+    try cache.append(&[_]f32{ 5.0, 6.0 }, &[_]f32{ 7.0, 8.0 });
+    try testing.expectEqual(@as(usize, 1), cache.len);
 }
