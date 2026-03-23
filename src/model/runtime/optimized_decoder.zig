@@ -1,13 +1,15 @@
 const std = @import("std");
-const attention = @import("../../kernel/attention/attention.zig");
 const cpu = @import("../../kernel/core/cpu.zig");
 const decoder_family = @import("decoder_family.zig");
 const generic_block = @import("../layers/rmsnorm_gqa_swiglu_block.zig");
 const gqa_attention = @import("../layers/gqa_attention.zig");
 const optimized_kv_cache = @import("optimized_kv_cache.zig");
+const optimized_decoder_support = @import("optimized_decoder/support.zig");
+const workspace_mod = @import("optimized_decoder/workspace.zig");
 const tensor_backend = @import("../../tensor/backends/backend.zig");
 const parallel_rows = @import("../../tensor/parallel/parallel_rows.zig");
-const weights_layout = @import("../layers/weights_layout.zig");
+
+pub const Workspace = workspace_mod.Workspace;
 
 pub const Runtime = struct {
     allocator: std.mem.Allocator,
@@ -45,11 +47,11 @@ pub const Runtime = struct {
 
         const common_weights = decoder_family.commonWeights(cfg.architecture);
         const layer_layout = decoder_family.layerLayout(cfg.architecture);
-        const io_scratch_bytes = maxIoScratchBytes(cfg);
+        const io_scratch_bytes = optimized_decoder_support.maxIoScratchBytes(cfg);
         const embed_tokens_tensor = try backend.resolveTensor(common_weights.embed_tokens_weight);
         const lm_head_tensor = try backend.resolveTensor(common_weights.lm_head_weight);
 
-        const final_norm_weight = try allocVector(&backend, allocator, common_weights.final_norm_weight, cfg.hidden_size, io_scratch_bytes);
+        const final_norm_weight = try optimized_decoder_support.allocVector(&backend, allocator, common_weights.final_norm_weight, cfg.hidden_size, io_scratch_bytes);
         errdefer allocator.free(final_norm_weight);
 
         const layers = try allocator.alloc(LayerWeights, cfg.num_hidden_layers);
@@ -92,7 +94,7 @@ pub const Runtime = struct {
     }
 
     pub fn initWorkspace(self: *const Runtime, max_seq_len: usize) !Workspace {
-        return try Workspace.init(self.allocator, self.cfg, max_seq_len, maxIoScratchBytes(self.cfg));
+        return try Workspace.init(self.allocator, self.cfg, max_seq_len, optimized_decoder_support.maxIoScratchBytes(self.cfg));
     }
 
     pub fn forwardTokenId(
@@ -199,19 +201,19 @@ const LayerWeights = struct {
 
         const input_ln_name = try decoder_family.layerTensorNameAlloc(allocator, cfg.architecture, layer_index, layout.input_layernorm_kind);
         defer allocator.free(input_ln_name);
-        const input_ln_weight = try allocVector(backend, allocator, input_ln_name, cfg.hidden_size, io_scratch_bytes);
+        const input_ln_weight = try optimized_decoder_support.allocVector(backend, allocator, input_ln_name, cfg.hidden_size, io_scratch_bytes);
         errdefer allocator.free(input_ln_weight);
 
         const post_ln_name = try decoder_family.layerTensorNameAlloc(allocator, cfg.architecture, layer_index, layout.post_attention_layernorm_kind);
         defer allocator.free(post_ln_name);
-        const post_ln_weight = try allocVector(backend, allocator, post_ln_name, cfg.hidden_size, io_scratch_bytes);
+        const post_ln_weight = try optimized_decoder_support.allocVector(backend, allocator, post_ln_name, cfg.hidden_size, io_scratch_bytes);
         errdefer allocator.free(post_ln_weight);
 
         const q_norm_weight = if (layout.q_norm_kind) |kind|
             try blk: {
                 const name = try decoder_family.layerTensorNameAlloc(allocator, cfg.architecture, layer_index, kind);
                 defer allocator.free(name);
-                break :blk allocVector(backend, allocator, name, cfg.head_dim, io_scratch_bytes);
+                break :blk optimized_decoder_support.allocVector(backend, allocator, name, cfg.head_dim, io_scratch_bytes);
             }
         else
             null;
@@ -221,7 +223,7 @@ const LayerWeights = struct {
             try blk: {
                 const name = try decoder_family.layerTensorNameAlloc(allocator, cfg.architecture, layer_index, kind);
                 defer allocator.free(name);
-                break :blk allocVector(backend, allocator, name, cfg.head_dim, io_scratch_bytes);
+                break :blk optimized_decoder_support.allocVector(backend, allocator, name, cfg.head_dim, io_scratch_bytes);
             }
         else
             null;
@@ -233,13 +235,13 @@ const LayerWeights = struct {
             .post_ln_weight = post_ln_weight,
             .q_norm_weight = q_norm_weight,
             .k_norm_weight = k_norm_weight,
-            .q_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.q_proj_kind),
-            .k_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.k_proj_kind),
-            .v_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.v_proj_kind),
-            .o_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.o_proj_kind),
-            .gate_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.gate_proj_kind),
-            .up_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.up_proj_kind),
-            .down_proj_tensor = try resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.down_proj_kind),
+            .q_proj_tensor = try optimized_decoder_support.resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.q_proj_kind),
+            .k_proj_tensor = try optimized_decoder_support.resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.k_proj_kind),
+            .v_proj_tensor = try optimized_decoder_support.resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.v_proj_kind),
+            .o_proj_tensor = try optimized_decoder_support.resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.o_proj_kind),
+            .gate_proj_tensor = try optimized_decoder_support.resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.gate_proj_kind),
+            .up_proj_tensor = try optimized_decoder_support.resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.up_proj_kind),
+            .down_proj_tensor = try optimized_decoder_support.resolveMatrixTensor(backend, allocator, cfg, layer_index, layout.down_proj_kind),
         };
     }
 
@@ -337,103 +339,3 @@ const LayerWeights = struct {
         }
     }
 };
-
-pub const Workspace = struct {
-    allocator: std.mem.Allocator,
-    hidden_a: []f32,
-    hidden_b: []f32,
-    normed: []f32,
-    q_proj: []f32,
-    k_proj: []f32,
-    v_proj: []f32,
-    attn_flat: []f32,
-    scores: []f32,
-    attn_out: []f32,
-    post_attn: []f32,
-    gate: []f32,
-    up: []f32,
-    mlp_out: []f32,
-    logits: []f32,
-    io_scratch: []u8,
-    rope_table: attention.RoPETable,
-
-    fn init(allocator: std.mem.Allocator, cfg: decoder_family.DecoderConfig, max_seq_len: usize, io_scratch_bytes: usize) !Workspace {
-        const kv_width = cfg.num_key_value_heads * cfg.head_dim;
-        var rope_table = try attention.RoPETable.init(
-            allocator,
-            max_seq_len,
-            cfg.head_dim,
-            @floatCast(cfg.rope_theta),
-        );
-        errdefer rope_table.deinit();
-        return .{
-            .allocator = allocator,
-            .hidden_a = try allocator.alloc(f32, cfg.hidden_size),
-            .hidden_b = try allocator.alloc(f32, cfg.hidden_size),
-            .normed = try allocator.alloc(f32, cfg.hidden_size),
-            .q_proj = try allocator.alloc(f32, cfg.num_attention_heads * cfg.head_dim),
-            .k_proj = try allocator.alloc(f32, kv_width),
-            .v_proj = try allocator.alloc(f32, kv_width),
-            .attn_flat = try allocator.alloc(f32, cfg.num_attention_heads * cfg.head_dim),
-            .scores = try allocator.alloc(f32, max_seq_len),
-            .attn_out = try allocator.alloc(f32, cfg.hidden_size),
-            .post_attn = try allocator.alloc(f32, cfg.hidden_size),
-            .gate = try allocator.alloc(f32, cfg.intermediate_size),
-            .up = try allocator.alloc(f32, cfg.intermediate_size),
-            .mlp_out = try allocator.alloc(f32, cfg.hidden_size),
-            .logits = try allocator.alloc(f32, cfg.vocab_size),
-            .io_scratch = try allocator.alloc(u8, io_scratch_bytes),
-            .rope_table = rope_table,
-        };
-    }
-
-    pub fn deinit(self: *Workspace) void {
-        self.allocator.free(self.hidden_a);
-        self.allocator.free(self.hidden_b);
-        self.allocator.free(self.normed);
-        self.allocator.free(self.q_proj);
-        self.allocator.free(self.k_proj);
-        self.allocator.free(self.v_proj);
-        self.allocator.free(self.attn_flat);
-        self.allocator.free(self.scores);
-        self.allocator.free(self.attn_out);
-        self.allocator.free(self.post_attn);
-        self.allocator.free(self.gate);
-        self.allocator.free(self.up);
-        self.allocator.free(self.mlp_out);
-        self.allocator.free(self.logits);
-        self.allocator.free(self.io_scratch);
-        self.rope_table.deinit();
-    }
-};
-
-fn allocVector(
-    backend: *tensor_backend.Backend,
-    allocator: std.mem.Allocator,
-    name: []const u8,
-    len: usize,
-    io_scratch_bytes: usize,
-) ![]f32 {
-    const output = try allocator.alloc(f32, len);
-    errdefer allocator.free(output);
-    const scratch = try allocator.alloc(u8, io_scratch_bytes);
-    defer allocator.free(scratch);
-    try backend.readVectorInto(name, output, scratch);
-    return output;
-}
-
-fn resolveMatrixTensor(
-    backend: *tensor_backend.Backend,
-    allocator: std.mem.Allocator,
-    cfg: decoder_family.DecoderConfig,
-    layer_index: usize,
-    kind: weights_layout.LayerTensorKind,
-) !tensor_backend.Backend.TensorHandle {
-    const name = try decoder_family.layerTensorNameAlloc(allocator, cfg.architecture, layer_index, kind);
-    defer allocator.free(name);
-    return try backend.resolveTensor(name);
-}
-
-fn maxIoScratchBytes(cfg: decoder_family.DecoderConfig) usize {
-    return @max(cfg.hidden_size, cfg.intermediate_size) * 4;
-}
