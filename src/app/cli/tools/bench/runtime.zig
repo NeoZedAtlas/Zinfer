@@ -4,6 +4,7 @@ const cli_prompts = @import("../../prompts.zig");
 const cli_runtime = @import("../../runtime.zig");
 const decoder_family = @import("../../../../model/runtime/decoder_family.zig");
 const kernel_registry = @import("../../../../kernel/registry.zig");
+const optimized_decoder = @import("../../../../model/runtime/optimized_decoder.zig");
 const optimized_kv_cache = @import("../../../../model/runtime/optimized_kv_cache.zig");
 const tensor_backend = @import("../../../../tensor/backends/backend.zig");
 const support = @import("support.zig");
@@ -129,6 +130,96 @@ pub fn benchSuite(allocator: std.mem.Allocator, model_dir: []const u8) !void {
             try benchPrompt(allocator, model_dir, profile.prompt, options);
         }
     }
+}
+
+pub fn benchBatchPrompt(
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    user_text: []const u8,
+    batch_size: usize,
+    options: GenerateOptions,
+) !void {
+    var runtime = try cli_runtime.GeneratorRuntime.init(allocator, model_dir, options.backend_scheme, options.thread_count);
+    defer runtime.deinit();
+    const cfg = runtime.model.cfg;
+    const resolved_kv_cache_scheme = optimized_kv_cache.resolveScheme(options.kv_cache_scheme, runtime.model.backendName());
+
+    const prompt = try cli_prompts.buildSingleUserPromptAlloc(
+        allocator,
+        cfg.architecture,
+        user_text,
+        options.system_prompt,
+        options.thinking_mode,
+    );
+    defer allocator.free(prompt);
+
+    var tokenize_timer = try std.time.Timer.start();
+    const prompt_ids_u32 = try runtime.tokenizer.encodeAlloc(allocator, prompt);
+    defer allocator.free(prompt_ids_u32);
+    const tokenize_ns = tokenize_timer.read();
+    if (prompt_ids_u32.len == 0) return error.EmptyPrompt;
+
+    const prompt_ids = try allocator.alloc(usize, prompt_ids_u32.len);
+    defer allocator.free(prompt_ids);
+    for (prompt_ids_u32, 0..) |token_id, idx| {
+        prompt_ids[idx] = token_id;
+    }
+
+    var batch = try optimized_decoder.BatchRuntime.init(
+        allocator,
+        &runtime.model,
+        batch_size,
+        prompt_ids.len + options.max_new_tokens,
+        resolved_kv_cache_scheme,
+        options.q8_layout,
+    );
+    defer batch.deinit();
+
+    var prefill_timer = try std.time.Timer.start();
+    for (0..batch_size) |request_index| {
+        try batch.prefillPromptIds(request_index, prompt_ids);
+    }
+    const prefill_ns = prefill_timer.read();
+
+    var decode_timer = try std.time.Timer.start();
+    const decode_stats = try batch.decodeRoundRobinArgMax(options.max_new_tokens);
+    const decode_ns = decode_timer.read();
+
+    const weights_size = runtime.model.artifactBytes();
+    const kv_cache_bytes_per_request = support.estimateKvCacheBytes(
+        cfg,
+        prompt_ids.len + options.max_new_tokens,
+        resolved_kv_cache_scheme,
+        options.q8_layout,
+    );
+    const total_prompt_tokens = prompt_ids.len * batch_size;
+    const total_kv_cache_bytes = kv_cache_bytes_per_request * batch_size;
+
+    const stdout = std.fs.File.stdout().deprecatedWriter();
+    try stdout.print("Zinfer batch benchmark\n", .{});
+    try stdout.print("model_dir: {s}\n", .{model_dir});
+    try stdout.print("backend: {s}\n", .{runtime.model.backendName()});
+    try stdout.print("kv_cache: {s}\n", .{resolved_kv_cache_scheme.name()});
+    try stdout.print("q8_layout: {s}\n", .{options.q8_layout.name()});
+    try stdout.print("kernel_isa: {s}\n", .{kernel_registry.activeIsa().name()});
+    try stdout.print("threads: {d}\n", .{runtime.model.thread_count});
+    try stdout.print("scheduler: round_robin\n", .{});
+    try stdout.print("batch_size: {d}\n", .{batch_size});
+    try stdout.print("prompt_tokens_per_request: {d}\n", .{prompt_ids.len});
+    try stdout.print("total_prompt_tokens: {d}\n", .{total_prompt_tokens});
+    try stdout.print("target_decode_tokens_per_request: {d}\n", .{options.max_new_tokens});
+    try stdout.print("decoded_tokens_total: {d}\n", .{decode_stats.total_decoded_tokens});
+    try stdout.print("finished_requests: {d}\n", .{decode_stats.finished_requests});
+    try stdout.print("tokenize_ms: {d:.3}\n", .{support.nsToMs(tokenize_ns)});
+    try stdout.print("prefill_ms: {d:.3}\n", .{support.nsToMs(prefill_ns)});
+    try stdout.print("decode_ms: {d:.3}\n", .{support.nsToMs(decode_ns)});
+    try stdout.print("prefill_tok_s: {d:.3}\n", .{support.tokensPerSecond(total_prompt_tokens, prefill_ns)});
+    try stdout.print("decode_tok_s: {d:.3}\n", .{support.tokensPerSecond(decode_stats.total_decoded_tokens, decode_ns)});
+    try stdout.print("weights_bytes: {d}\n", .{weights_size});
+    try stdout.print("weights_mib: {d:.3}\n", .{support.bytesToMiB(weights_size)});
+    try stdout.print("kv_cache_bytes_per_request: {d}\n", .{kv_cache_bytes_per_request});
+    try stdout.print("kv_cache_bytes_total: {d}\n", .{total_kv_cache_bytes});
+    try stdout.print("kv_cache_mib_total: {d:.3}\n", .{support.bytesToMiB(total_kv_cache_bytes)});
 }
 
 fn initBenchSuiteOptions(

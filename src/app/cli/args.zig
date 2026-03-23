@@ -65,6 +65,17 @@ pub const ParsedBenchInvocation = struct {
     }
 };
 
+pub const ParsedBenchBatchInvocation = struct {
+    model_dir: []const u8,
+    user_text: []const u8,
+    batch_size: usize,
+    options: GenerateOptions,
+
+    pub fn deinit(self: *ParsedBenchBatchInvocation, allocator: std.mem.Allocator) void {
+        self.options.deinit(allocator);
+    }
+};
+
 pub fn parseGenerateInvocation(
     allocator: std.mem.Allocator,
     args: []const []const u8,
@@ -242,6 +253,44 @@ pub fn parseBenchInvocation(
     return .{
         .model_dir = model_dir,
         .user_text = user_text,
+        .options = options,
+    };
+}
+
+pub fn parseBenchBatchInvocation(
+    allocator: std.mem.Allocator,
+    args: []const []const u8,
+) !ParsedBenchBatchInvocation {
+    if (args.len < 4) return error.InvalidCommand;
+
+    var model_dir: []const u8 = default_model_dir;
+    var user_text: []const u8 = undefined;
+    var batch_size: usize = undefined;
+    var start_flags: usize = undefined;
+    var options = initGenerateOptions(.disabled, 16);
+
+    if (std.fmt.parseInt(usize, args[3], 10)) |parsed_batch_size| {
+        user_text = args[2];
+        batch_size = parsed_batch_size;
+        start_flags = 4;
+    } else |_| {
+        if (args.len < 5) return error.InvalidCommand;
+        model_dir = args[2];
+        user_text = args[3];
+        batch_size = try std.fmt.parseInt(usize, args[4], 10);
+        start_flags = 5;
+    }
+
+    if (args.len > start_flags and !isFlagArg(args[start_flags])) {
+        options.max_new_tokens = try std.fmt.parseInt(usize, args[start_flags], 10);
+        start_flags += 1;
+    }
+
+    try parseGenerateFlags(allocator, args[start_flags..], &options);
+    return .{
+        .model_dir = model_dir,
+        .user_text = user_text,
+        .batch_size = batch_size,
         .options = options,
     };
 }

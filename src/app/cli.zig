@@ -160,6 +160,19 @@ pub fn run(allocator: std.mem.Allocator) !void {
         return;
     }
 
+    if (std.mem.eql(u8, command, "bench-batch")) {
+        var invocation = try cli_args.parseBenchBatchInvocation(allocator, args);
+        defer invocation.deinit(allocator);
+        try cli_tools.benchBatchPrompt(
+            allocator,
+            invocation.model_dir,
+            invocation.user_text,
+            invocation.batch_size,
+            invocation.options,
+        );
+        return;
+    }
+
     if (std.mem.eql(u8, command, "bench-ops")) {
         var model_dir: []const u8 = default_model_dir;
         var iterations: usize = 0;
