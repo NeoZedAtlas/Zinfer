@@ -188,10 +188,68 @@ pub fn matmulQ6Rows(output: []f32, bytes: []const u8, row_bytes: usize, input: [
     std.debug.assert(row_bytes == 4 + (std.math.divCeil(usize, input.len * 6, 8) catch unreachable));
     std.debug.assert(bytes.len == output.len * row_bytes);
 
+    switch (kernel_registry.resolve(.{ .gemv_row = .{ .op = .q6_row, .cols = input.len } }).shape) {
+        .qwen3_hidden_1024 => {
+            matmulQ6RowsFixedPair(tensor_store.handwritten_hidden_width, output, bytes, row_bytes, input);
+            return;
+        },
+        .qwen3_intermediate_3072 => {
+            matmulQ6RowsFixedPair(tensor_store.handwritten_intermediate_width, output, bytes, row_bytes, input);
+            return;
+        },
+        else => {},
+    }
+
     var row_offset: u64 = 0;
     for (output) |*value| {
         value.* = dotQ6Row(bytes, row_offset, input);
         row_offset += row_bytes;
+    }
+}
+
+fn matmulQ6RowsFixedPair(
+    comptime cols: usize,
+    output: []f32,
+    bytes: []const u8,
+    row_bytes: usize,
+    input: []const f32,
+) void {
+    std.debug.assert(input.len == cols);
+
+    var row_idx: usize = 0;
+    while (row_idx + 1 < output.len) : (row_idx += 2) {
+        const row0_start = row_idx * row_bytes;
+        const row1_start = row0_start + row_bytes;
+        const row0_payload = bytes[row0_start + 4 .. row0_start + row_bytes];
+        const row1_payload = bytes[row1_start + 4 .. row1_start + row_bytes];
+        const row0_scale: f32 = @bitCast(std.mem.readInt(u32, bytes[row0_start .. row0_start + 4][0..4], .little));
+        const row1_scale: f32 = @bitCast(std.mem.readInt(u32, bytes[row1_start .. row1_start + 4][0..4], .little));
+
+        var row0_acc0: @Vector(8, f32) = @splat(0.0);
+        var row0_acc1: @Vector(8, f32) = @splat(0.0);
+        var row1_acc0: @Vector(8, f32) = @splat(0.0);
+        var row1_acc1: @Vector(8, f32) = @splat(0.0);
+        var index: usize = 0;
+        var payload_index: usize = 0;
+        while (index < cols) : ({
+            index += 16;
+            payload_index += 12;
+        }) {
+            const rhs0: @Vector(8, f32) = input[index..][0..8].*;
+            const rhs1: @Vector(8, f32) = input[index + 8 ..][0..8].*;
+
+            row0_acc0 += loadQ6Vector8(row0_payload, payload_index) * rhs0;
+            row0_acc1 += loadQ6Vector8(row0_payload, payload_index + 6) * rhs1;
+            row1_acc0 += loadQ6Vector8(row1_payload, payload_index) * rhs0;
+            row1_acc1 += loadQ6Vector8(row1_payload, payload_index + 6) * rhs1;
+        }
+
+        output[row_idx] = @reduce(.Add, row0_acc0 + row0_acc1) * row0_scale;
+        output[row_idx + 1] = @reduce(.Add, row1_acc0 + row1_acc1) * row1_scale;
+    }
+
+    if (row_idx < output.len) {
+        output[row_idx] = dotQ6RowFixed(cols, bytes, @as(u64, row_idx * row_bytes), input);
     }
 }
 
@@ -459,6 +517,43 @@ test "wide quantized handwritten kernels match generic path" {
         try testing.expectApproxEqAbs(dotQ8RowGeneric(row_q8, 0, input), dotQ8Row(row_q8, 0, input), 1e-6);
         try testing.expectApproxEqAbs(dotQ6RowGeneric(row_q6, 0, input), dotQ6Row(row_q6, 0, input), 1e-6);
         try testing.expectApproxEqAbs(dotQ4RowGeneric(row_q4, 0, input), dotQ4Row(row_q4, 0, input), 1e-6);
+    }
+}
+
+test "wide q6 matmul rows match row-dot path" {
+    const testing = std.testing;
+
+    inline for (.{ tensor_store.handwritten_hidden_width, tensor_store.handwritten_intermediate_width }) |cols| {
+        const rows: usize = 3;
+        const row_bytes = 4 + (try std.math.divCeil(usize, cols * 6, 8));
+        const matrix = try testing.allocator.alloc(u8, rows * row_bytes);
+        defer testing.allocator.free(matrix);
+        const values = try testing.allocator.alloc(f32, cols);
+        defer testing.allocator.free(values);
+        const input = try testing.allocator.alloc(f32, cols);
+        defer testing.allocator.free(input);
+        const output = try testing.allocator.alloc(f32, rows);
+        defer testing.allocator.free(output);
+
+        for (input, 0..) |*value, idx| {
+            value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 5 + 11) % 37)) - 18)) / 8.0;
+        }
+        for (0..rows) |row_idx| {
+            for (values, 0..) |*value, col_idx| {
+                value.* = @as(f32, @floatFromInt(@as(i32, @intCast((row_idx * 19 + col_idx * 7 + 3) % 41)) - 20)) / 9.0;
+            }
+            encodeQ6Row(matrix[row_idx * row_bytes .. (row_idx + 1) * row_bytes], values);
+        }
+
+        matmulQ6Rows(output, matrix, row_bytes, input);
+
+        for (0..rows) |row_idx| {
+            try testing.expectApproxEqAbs(
+                dotQ6Row(matrix, @as(u64, row_idx * row_bytes), input),
+                output[row_idx],
+                1e-6,
+            );
+        }
     }
 }
 
