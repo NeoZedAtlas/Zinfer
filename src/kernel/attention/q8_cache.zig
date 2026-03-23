@@ -6,6 +6,7 @@ const basic = @import("basic.zig");
 pub const q8_cache_group_size: usize = 16;
 const handwritten_q8_head_dim: usize = 128;
 const handwritten_q8_scale_groups: usize = handwritten_q8_head_dim / q8_cache_group_size;
+const paired_scores_max_seq_len: usize = 4096;
 
 pub fn scaledDotProductAttentionSingleQueryQ8Cache(
     output: []f32,
@@ -319,6 +320,48 @@ fn scaledDotProductAttentionSingleQueryQ8CacheHeadMajor128(
 
     @memset(output, 0.0);
 
+    if (group_size == 2 and seq_len <= paired_scores_max_seq_len) {
+        var paired_scores: [paired_scores_max_seq_len]f32 = undefined;
+        var q_head_idx: usize = 0;
+        while (q_head_idx < num_query_heads) : (q_head_idx += 2) {
+            const q0_start = q_head_idx * head_dim;
+            const q1_start = q0_start + head_dim;
+            const q0_slice = query[q0_start .. q0_start + head_dim];
+            const q1_slice = query[q1_start .. q1_start + head_dim];
+            const kv_head_idx = q_head_idx / group_size;
+            const head_data_start = kv_head_idx * data_head_stride;
+            const head_scale_start = kv_head_idx * scale_head_stride;
+            const scores0 = scores_scratch[0..seq_len];
+            const scores1 = paired_scores[0..seq_len];
+
+            for (0..seq_len) |pos| {
+                const cache_start = head_data_start + pos * head_dim;
+                const scale_start = head_scale_start + pos * handwritten_q8_scale_groups;
+                const pair = dotQ8GroupedSlice128PairExact(
+                    q0_slice,
+                    q1_slice,
+                    key_cache[cache_start .. cache_start + head_dim],
+                    key_scales[scale_start .. scale_start + handwritten_q8_scale_groups],
+                );
+                scores0[pos] = pair[0] * scale;
+                scores1[pos] = pair[1] * scale;
+            }
+
+            try basic.softmaxInPlace(scores0);
+            try basic.softmaxInPlace(scores1);
+
+            accumulateQ8ValueHead128HeadMajorPair(
+                output[q0_start .. q0_start + head_dim],
+                output[q1_start .. q1_start + head_dim],
+                scores0,
+                scores1,
+                value_cache[head_data_start .. head_data_start + seq_len * head_dim],
+                value_scales[head_scale_start .. head_scale_start + seq_len * handwritten_q8_scale_groups],
+            );
+        }
+        return;
+    }
+
     for (0..num_query_heads) |q_head_idx| {
         const q_start = q_head_idx * head_dim;
         const q_slice = query[q_start .. q_start + head_dim];
@@ -435,6 +478,31 @@ fn dotQ8GroupedSlice128Exact(lhs: []const f32, rhs_q8: []const i8, scales: []con
         dotQ8Block16(lhs[112..128], rhs_q8[112..128], scales[7]);
 }
 
+fn dotQ8GroupedSlice128PairExact(
+    lhs0: []const f32,
+    lhs1: []const f32,
+    rhs_q8: []const i8,
+    scales: []const u16,
+) [2]f32 {
+    std.debug.assert(lhs0.len == handwritten_q8_head_dim);
+    std.debug.assert(lhs1.len == handwritten_q8_head_dim);
+    std.debug.assert(rhs_q8.len == handwritten_q8_head_dim);
+    std.debug.assert(scales.len == handwritten_q8_scale_groups);
+
+    var sum0: f32 = 0.0;
+    var sum1: f32 = 0.0;
+    inline for (0..handwritten_q8_scale_groups) |group_idx| {
+        const block_start = group_idx * 16;
+        const rhs_vec = loadQ8Vector16Unscaled(rhs_q8, block_start);
+        const scale = bfloat16.toF32(scales[group_idx]);
+        const lhs0_vec: @Vector(16, f32) = lhs0[block_start..][0..16].*;
+        const lhs1_vec: @Vector(16, f32) = lhs1[block_start..][0..16].*;
+        sum0 += @reduce(.Add, lhs0_vec * rhs_vec) * scale;
+        sum1 += @reduce(.Add, lhs1_vec * rhs_vec) * scale;
+    }
+    return .{ sum0, sum1 };
+}
+
 fn axpyQ8GroupedSliceExactInPlace(output: []f32, alpha: f32, input_q8: []const i8, scales: []const u16) void {
     var index: usize = 0;
     for (scales) |scale_bits| {
@@ -531,11 +599,110 @@ fn accumulateQ8ValueHead128HeadMajor(
     output[112..128].* = acc7;
 }
 
+fn accumulateQ8ValueHead128HeadMajorPair(
+    output0: []f32,
+    output1: []f32,
+    scores0: []const f32,
+    scores1: []const f32,
+    value_cache_head: []const i8,
+    value_scales_head: []const u16,
+) void {
+    std.debug.assert(output0.len == handwritten_q8_head_dim);
+    std.debug.assert(output1.len == handwritten_q8_head_dim);
+
+    var acc00: @Vector(16, f32) = @splat(0.0);
+    var acc01: @Vector(16, f32) = @splat(0.0);
+    var acc02: @Vector(16, f32) = @splat(0.0);
+    var acc03: @Vector(16, f32) = @splat(0.0);
+    var acc04: @Vector(16, f32) = @splat(0.0);
+    var acc05: @Vector(16, f32) = @splat(0.0);
+    var acc06: @Vector(16, f32) = @splat(0.0);
+    var acc07: @Vector(16, f32) = @splat(0.0);
+
+    var acc10: @Vector(16, f32) = @splat(0.0);
+    var acc11: @Vector(16, f32) = @splat(0.0);
+    var acc12: @Vector(16, f32) = @splat(0.0);
+    var acc13: @Vector(16, f32) = @splat(0.0);
+    var acc14: @Vector(16, f32) = @splat(0.0);
+    var acc15: @Vector(16, f32) = @splat(0.0);
+    var acc16: @Vector(16, f32) = @splat(0.0);
+    var acc17: @Vector(16, f32) = @splat(0.0);
+
+    for (scores0, scores1, 0..) |weight0, weight1, pos| {
+        const cache_start = pos * handwritten_q8_head_dim;
+        const scale_start = pos * handwritten_q8_scale_groups;
+
+        inline for (0..handwritten_q8_scale_groups) |group_idx| {
+            const block_start = cache_start + group_idx * 16;
+            const value_vec = loadQ8Vector16Unscaled(value_cache_head, block_start);
+            const scale = bfloat16.toF32(value_scales_head[scale_start + group_idx]);
+            const scaled0: @Vector(16, f32) = @splat(weight0 * scale);
+            const scaled1: @Vector(16, f32) = @splat(weight1 * scale);
+            switch (group_idx) {
+                0 => {
+                    acc00 += value_vec * scaled0;
+                    acc10 += value_vec * scaled1;
+                },
+                1 => {
+                    acc01 += value_vec * scaled0;
+                    acc11 += value_vec * scaled1;
+                },
+                2 => {
+                    acc02 += value_vec * scaled0;
+                    acc12 += value_vec * scaled1;
+                },
+                3 => {
+                    acc03 += value_vec * scaled0;
+                    acc13 += value_vec * scaled1;
+                },
+                4 => {
+                    acc04 += value_vec * scaled0;
+                    acc14 += value_vec * scaled1;
+                },
+                5 => {
+                    acc05 += value_vec * scaled0;
+                    acc15 += value_vec * scaled1;
+                },
+                6 => {
+                    acc06 += value_vec * scaled0;
+                    acc16 += value_vec * scaled1;
+                },
+                7 => {
+                    acc07 += value_vec * scaled0;
+                    acc17 += value_vec * scaled1;
+                },
+                else => unreachable,
+            }
+        }
+    }
+
+    output0[0..16].* = acc00;
+    output0[16..32].* = acc01;
+    output0[32..48].* = acc02;
+    output0[48..64].* = acc03;
+    output0[64..80].* = acc04;
+    output0[80..96].* = acc05;
+    output0[96..112].* = acc06;
+    output0[112..128].* = acc07;
+
+    output1[0..16].* = acc10;
+    output1[16..32].* = acc11;
+    output1[32..48].* = acc12;
+    output1[48..64].* = acc13;
+    output1[64..80].* = acc14;
+    output1[80..96].* = acc15;
+    output1[96..112].* = acc16;
+    output1[112..128].* = acc17;
+}
+
 fn scaledQ8Vector16(input_q8: []const i8, start: usize, scale: f32) @Vector(16, f32) {
     const scale_vec: @Vector(16, f32) = @splat(scale);
+    return loadQ8Vector16Unscaled(input_q8, start) * scale_vec;
+}
+
+fn loadQ8Vector16Unscaled(input_q8: []const i8, start: usize) @Vector(16, f32) {
     const input_i8: @Vector(16, i8) = input_q8[start..][0..16].*;
-    const input_f32: @Vector(16, f32) = @floatFromInt(input_i8);
-    return input_f32 * scale_vec;
+    return @floatFromInt(input_i8);
 }
 
 fn dotQ8Block16(lhs: []const f32, rhs_q8: []const i8, scale_bits: u16) f32 {
