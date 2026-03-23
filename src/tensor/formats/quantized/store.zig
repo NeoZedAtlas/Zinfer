@@ -202,32 +202,22 @@ pub const Store = struct {
         start_row: usize,
         end_row: usize,
     ) void {
-        var row_offset = tensor.absolute_offset + @as(u64, start_row) * tensor.row_bytes;
+        const row_count = end_row - start_row;
+        const byte_start = @as(usize, @intCast(tensor.absolute_offset + @as(u64, start_row) * tensor.row_bytes));
+        const byte_len = @as(usize, @intCast(@as(u64, row_count) * tensor.row_bytes));
+        const bytes = self.bytes[byte_start .. byte_start + byte_len];
+        const output_slice = output[start_row..end_row];
         switch (tensor.encoding) {
             .f32 => {
+                var row_offset = tensor.absolute_offset + @as(u64, start_row) * tensor.row_bytes;
                 for (start_row..end_row) |row_idx| {
                     output[row_idx] = tensor_store.dotF32Row(self.bytes[@intCast(row_offset)..][0 .. input.len * 4], input);
                     row_offset += tensor.row_bytes;
                 }
             },
-            .q6_0 => {
-                for (start_row..end_row) |row_idx| {
-                    output[row_idx] = kernels.dotQ6Row(self.bytes, row_offset, input);
-                    row_offset += tensor.row_bytes;
-                }
-            },
-            .q8_0 => {
-                for (start_row..end_row) |row_idx| {
-                    output[row_idx] = kernels.dotQ8Row(self.bytes, row_offset, input);
-                    row_offset += tensor.row_bytes;
-                }
-            },
-            .q4_0 => {
-                for (start_row..end_row) |row_idx| {
-                    output[row_idx] = kernels.dotQ4Row(self.bytes, row_offset, input);
-                    row_offset += tensor.row_bytes;
-                }
-            },
+            .q6_0 => kernels.matmulQ6Rows(output_slice, bytes, @intCast(tensor.row_bytes), input),
+            .q8_0 => kernels.matmulQ8Rows(output_slice, bytes, @intCast(tensor.row_bytes), input),
+            .q4_0 => kernels.matmulQ4Rows(output_slice, bytes, @intCast(tensor.row_bytes), input),
         }
     }
 

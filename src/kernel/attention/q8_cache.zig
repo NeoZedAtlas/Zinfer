@@ -414,11 +414,7 @@ fn dotQ8GroupedSliceExact(lhs: []const f32, rhs_q8: []const i8, scales: []const 
     var sum: f32 = 0.0;
     var index: usize = 0;
     for (scales) |scale_bits| {
-        const scale = bfloat16.toF32(scale_bits);
-        const lhs_vec: @Vector(16, f32) = lhs[index..][0..16].*;
-        const rhs_i8: @Vector(16, i8) = rhs_q8[index..][0..16].*;
-        const rhs_vec: @Vector(16, f32) = @floatFromInt(rhs_i8);
-        sum += @reduce(.Add, lhs_vec * rhs_vec) * scale;
+        sum += dotQ8Block16(lhs[index..][0..16], rhs_q8[index..][0..16], scale_bits);
         index += 16;
     }
     return sum;
@@ -429,25 +425,14 @@ fn dotQ8GroupedSlice128Exact(lhs: []const f32, rhs_q8: []const i8, scales: []con
     std.debug.assert(rhs_q8.len == handwritten_q8_head_dim);
     std.debug.assert(scales.len == handwritten_q8_scale_groups);
 
-    var acc0: @Vector(16, f32) = @splat(0.0);
-    var acc1: @Vector(16, f32) = @splat(0.0);
-    var acc2: @Vector(16, f32) = @splat(0.0);
-    var acc3: @Vector(16, f32) = @splat(0.0);
-    var acc4: @Vector(16, f32) = @splat(0.0);
-    var acc5: @Vector(16, f32) = @splat(0.0);
-    var acc6: @Vector(16, f32) = @splat(0.0);
-    var acc7: @Vector(16, f32) = @splat(0.0);
-
-    acc0 += lhs[0..16].* * scaledQ8Vector16(rhs_q8, 0, bfloat16.toF32(scales[0]));
-    acc1 += lhs[16..32].* * scaledQ8Vector16(rhs_q8, 16, bfloat16.toF32(scales[1]));
-    acc2 += lhs[32..48].* * scaledQ8Vector16(rhs_q8, 32, bfloat16.toF32(scales[2]));
-    acc3 += lhs[48..64].* * scaledQ8Vector16(rhs_q8, 48, bfloat16.toF32(scales[3]));
-    acc4 += lhs[64..80].* * scaledQ8Vector16(rhs_q8, 64, bfloat16.toF32(scales[4]));
-    acc5 += lhs[80..96].* * scaledQ8Vector16(rhs_q8, 80, bfloat16.toF32(scales[5]));
-    acc6 += lhs[96..112].* * scaledQ8Vector16(rhs_q8, 96, bfloat16.toF32(scales[6]));
-    acc7 += lhs[112..128].* * scaledQ8Vector16(rhs_q8, 112, bfloat16.toF32(scales[7]));
-
-    return @reduce(.Add, acc0 + acc1 + acc2 + acc3 + acc4 + acc5 + acc6 + acc7);
+    return dotQ8Block16(lhs[0..16], rhs_q8[0..16], scales[0]) +
+        dotQ8Block16(lhs[16..32], rhs_q8[16..32], scales[1]) +
+        dotQ8Block16(lhs[32..48], rhs_q8[32..48], scales[2]) +
+        dotQ8Block16(lhs[48..64], rhs_q8[48..64], scales[3]) +
+        dotQ8Block16(lhs[64..80], rhs_q8[64..80], scales[4]) +
+        dotQ8Block16(lhs[80..96], rhs_q8[80..96], scales[5]) +
+        dotQ8Block16(lhs[96..112], rhs_q8[96..112], scales[6]) +
+        dotQ8Block16(lhs[112..128], rhs_q8[112..128], scales[7]);
 }
 
 fn axpyQ8GroupedSliceExactInPlace(output: []f32, alpha: f32, input_q8: []const i8, scales: []const u16) void {
@@ -551,6 +536,13 @@ fn scaledQ8Vector16(input_q8: []const i8, start: usize, scale: f32) @Vector(16, 
     const input_i8: @Vector(16, i8) = input_q8[start..][0..16].*;
     const input_f32: @Vector(16, f32) = @floatFromInt(input_i8);
     return input_f32 * scale_vec;
+}
+
+fn dotQ8Block16(lhs: []const f32, rhs_q8: []const i8, scale_bits: u16) f32 {
+    const lhs_vec: @Vector(16, f32) = lhs[0..16].*;
+    const rhs_i8: @Vector(16, i8) = rhs_q8[0..16].*;
+    const rhs_vec: @Vector(16, f32) = @floatFromInt(rhs_i8);
+    return @reduce(.Add, lhs_vec * rhs_vec) * bfloat16.toF32(scale_bits);
 }
 
 test "q8 attention handwritten 128 full path matches generic path" {
