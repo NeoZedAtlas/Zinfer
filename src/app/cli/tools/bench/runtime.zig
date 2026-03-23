@@ -203,7 +203,8 @@ pub fn benchBatchPrompt(
     try stdout.print("q8_layout: {s}\n", .{options.q8_layout.name()});
     try stdout.print("kernel_isa: {s}\n", .{kernel_registry.activeIsa().name()});
     try stdout.print("threads: {d}\n", .{runtime.model.thread_count});
-    try stdout.print("scheduler: round_robin\n", .{});
+    try stdout.print("scheduler: {s}\n", .{if (decode_stats.scheduler_workers > 1) "synchronous_parallel" else "round_robin"});
+    try stdout.print("scheduler_workers: {d}\n", .{decode_stats.scheduler_workers});
     try stdout.print("batch_size: {d}\n", .{batch_size});
     try stdout.print("prompt_tokens_per_request: {d}\n", .{prompt_ids.len});
     try stdout.print("total_prompt_tokens: {d}\n", .{total_prompt_tokens});

@@ -20,6 +20,7 @@ pub const RequestState = struct {
 pub const DecodeStats = struct {
     total_decoded_tokens: usize,
     finished_requests: usize,
+    scheduler_workers: usize,
 };
 
 pub const BatchRuntime = struct {
@@ -91,26 +92,79 @@ pub const BatchRuntime = struct {
         var active_requests = self.requests.len;
         var total_decoded_tokens: usize = 0;
         var finished_requests: usize = 0;
+        const scheduler_workers = self.schedulerWorkerCount();
 
         for (0..max_new_tokens) |_| {
             if (active_requests == 0) break;
 
             var progressed = false;
-            for (self.requests) |*request| {
-                if (!request.active) continue;
+            if (scheduler_workers <= 1) {
+                for (self.requests) |*request| {
+                    if (!request.active) continue;
 
-                const next_token = try decoder_family.argMaxLogit(request.workspace.logits);
-                if (decoder_family.isEosToken(self.model.cfg.architecture, next_token)) {
-                    request.active = false;
-                    active_requests -= 1;
-                    finished_requests += 1;
-                    continue;
+                    const next_token = try decoder_family.argMaxLogit(request.workspace.logits);
+                    if (decoder_family.isEosToken(self.model.cfg.architecture, next_token)) {
+                        request.active = false;
+                        active_requests -= 1;
+                        finished_requests += 1;
+                        continue;
+                    }
+
+                    _ = try self.model.forwardTokenId(&request.workspace, &request.cache, next_token);
+                    request.decoded_tokens += 1;
+                    total_decoded_tokens += 1;
+                    progressed = true;
+                }
+            } else {
+                var launches = std.ArrayListUnmanaged(Launch).empty;
+                defer launches.deinit(self.allocator);
+
+                for (self.requests) |*request| {
+                    if (!request.active) continue;
+
+                    const next_token = try decoder_family.argMaxLogit(request.workspace.logits);
+                    if (decoder_family.isEosToken(self.model.cfg.architecture, next_token)) {
+                        request.active = false;
+                        active_requests -= 1;
+                        finished_requests += 1;
+                        continue;
+                    }
+
+                    try launches.append(self.allocator, .{
+                        .request = request,
+                        .token_id = next_token,
+                    });
                 }
 
-                _ = try self.model.forwardTokenId(&request.workspace, &request.cache, next_token);
-                request.decoded_tokens += 1;
-                total_decoded_tokens += 1;
-                progressed = true;
+                if (launches.items.len != 0) {
+                    const worker_count = @min(scheduler_workers, launches.items.len);
+                    const threads = try self.allocator.alloc(std.Thread, worker_count - 1);
+                    defer self.allocator.free(threads);
+                    const contexts = try self.allocator.alloc(WorkerContext, worker_count - 1);
+                    defer self.allocator.free(contexts);
+                    const chunk = std.math.divCeil(usize, launches.items.len, worker_count) catch unreachable;
+
+                    var start_index: usize = 0;
+                    for (0..worker_count - 1) |idx| {
+                        const end_index = @min(launches.items.len, start_index + chunk);
+                        contexts[idx] = .{
+                            .runtime = self.model,
+                            .launches = launches.items[start_index..end_index],
+                        };
+                        threads[idx] = try std.Thread.spawn(.{}, WorkerContext.run, .{&contexts[idx]});
+                        start_index = end_index;
+                    }
+
+                    runLaunchRange(self.model, launches.items[start_index..]);
+                    for (threads) |thread| thread.join();
+
+                    for (launches.items) |*launch| {
+                        _ = try launch.result;
+                        launch.request.decoded_tokens += 1;
+                        total_decoded_tokens += 1;
+                        progressed = true;
+                    }
+                }
             }
 
             if (!progressed) break;
@@ -119,15 +173,44 @@ pub const BatchRuntime = struct {
         return .{
             .total_decoded_tokens = total_decoded_tokens,
             .finished_requests = finished_requests,
+            .scheduler_workers = scheduler_workers,
         };
     }
+
+    fn schedulerWorkerCount(self: *const BatchRuntime) usize {
+        if (self.model.thread_count != 1) return 1;
+        return @min(self.requests.len, std.Thread.getCpuCount() catch 1);
+    }
 };
+
+const Launch = struct {
+    request: *RequestState,
+    token_id: usize,
+    result: anyerror![]f32 = &.{},
+};
+
+const WorkerContext = struct {
+    runtime: *runtime_mod.Runtime,
+    launches: []Launch,
+
+    fn run(self: *WorkerContext) void {
+        runLaunchRange(self.runtime, self.launches);
+    }
+};
+
+fn runLaunchRange(runtime: *runtime_mod.Runtime, launches: []Launch) void {
+    for (launches) |*launch| {
+        launch.result = runtime.forwardTokenId(&launch.request.workspace, &launch.request.cache, launch.token_id);
+    }
+}
 
 test "batch runtime decode stats default to finished when no request progresses" {
     const stats = DecodeStats{
         .total_decoded_tokens = 0,
         .finished_requests = 0,
+        .scheduler_workers = 0,
     };
     try std.testing.expectEqual(@as(usize, 0), stats.total_decoded_tokens);
     try std.testing.expectEqual(@as(usize, 0), stats.finished_requests);
+    try std.testing.expectEqual(@as(usize, 0), stats.scheduler_workers);
 }
