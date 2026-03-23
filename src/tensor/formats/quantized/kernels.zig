@@ -190,11 +190,11 @@ pub fn matmulQ6Rows(output: []f32, bytes: []const u8, row_bytes: usize, input: [
 
     switch (kernel_registry.resolve(.{ .gemv_row = .{ .op = .q6_row, .cols = input.len } }).shape) {
         .qwen3_hidden_1024 => {
-            matmulQ6RowsFixedPair(tensor_store.handwritten_hidden_width, output, bytes, row_bytes, input);
+            matmulQ6RowsFixedBlocks(tensor_store.handwritten_hidden_width, output, bytes, row_bytes, input);
             return;
         },
         .qwen3_intermediate_3072 => {
-            matmulQ6RowsFixedPair(tensor_store.handwritten_intermediate_width, output, bytes, row_bytes, input);
+            matmulQ6RowsFixedBlocks(tensor_store.handwritten_intermediate_width, output, bytes, row_bytes, input);
             return;
         },
         else => {},
@@ -207,7 +207,7 @@ pub fn matmulQ6Rows(output: []f32, bytes: []const u8, row_bytes: usize, input: [
     }
 }
 
-fn matmulQ6RowsFixedPair(
+fn matmulQ6RowsFixedBlocks(
     comptime cols: usize,
     output: []f32,
     bytes: []const u8,
@@ -217,6 +217,53 @@ fn matmulQ6RowsFixedPair(
     std.debug.assert(input.len == cols);
 
     var row_idx: usize = 0;
+    while (row_idx + 3 < output.len) : (row_idx += 4) {
+        const row0_start = row_idx * row_bytes;
+        const row1_start = row0_start + row_bytes;
+        const row2_start = row1_start + row_bytes;
+        const row3_start = row2_start + row_bytes;
+        const row0_payload = bytes[row0_start + 4 .. row0_start + row_bytes];
+        const row1_payload = bytes[row1_start + 4 .. row1_start + row_bytes];
+        const row2_payload = bytes[row2_start + 4 .. row2_start + row_bytes];
+        const row3_payload = bytes[row3_start + 4 .. row3_start + row_bytes];
+        const row0_scale: f32 = @bitCast(std.mem.readInt(u32, bytes[row0_start .. row0_start + 4][0..4], .little));
+        const row1_scale: f32 = @bitCast(std.mem.readInt(u32, bytes[row1_start .. row1_start + 4][0..4], .little));
+        const row2_scale: f32 = @bitCast(std.mem.readInt(u32, bytes[row2_start .. row2_start + 4][0..4], .little));
+        const row3_scale: f32 = @bitCast(std.mem.readInt(u32, bytes[row3_start .. row3_start + 4][0..4], .little));
+
+        var row0_acc0: @Vector(8, f32) = @splat(0.0);
+        var row0_acc1: @Vector(8, f32) = @splat(0.0);
+        var row1_acc0: @Vector(8, f32) = @splat(0.0);
+        var row1_acc1: @Vector(8, f32) = @splat(0.0);
+        var row2_acc0: @Vector(8, f32) = @splat(0.0);
+        var row2_acc1: @Vector(8, f32) = @splat(0.0);
+        var row3_acc0: @Vector(8, f32) = @splat(0.0);
+        var row3_acc1: @Vector(8, f32) = @splat(0.0);
+        var index: usize = 0;
+        var payload_index: usize = 0;
+        while (index < cols) : ({
+            index += 16;
+            payload_index += 12;
+        }) {
+            const rhs0: @Vector(8, f32) = input[index..][0..8].*;
+            const rhs1: @Vector(8, f32) = input[index + 8 ..][0..8].*;
+
+            row0_acc0 += loadQ6Vector8(row0_payload, payload_index) * rhs0;
+            row0_acc1 += loadQ6Vector8(row0_payload, payload_index + 6) * rhs1;
+            row1_acc0 += loadQ6Vector8(row1_payload, payload_index) * rhs0;
+            row1_acc1 += loadQ6Vector8(row1_payload, payload_index + 6) * rhs1;
+            row2_acc0 += loadQ6Vector8(row2_payload, payload_index) * rhs0;
+            row2_acc1 += loadQ6Vector8(row2_payload, payload_index + 6) * rhs1;
+            row3_acc0 += loadQ6Vector8(row3_payload, payload_index) * rhs0;
+            row3_acc1 += loadQ6Vector8(row3_payload, payload_index + 6) * rhs1;
+        }
+
+        output[row_idx] = @reduce(.Add, row0_acc0 + row0_acc1) * row0_scale;
+        output[row_idx + 1] = @reduce(.Add, row1_acc0 + row1_acc1) * row1_scale;
+        output[row_idx + 2] = @reduce(.Add, row2_acc0 + row2_acc1) * row2_scale;
+        output[row_idx + 3] = @reduce(.Add, row3_acc0 + row3_acc1) * row3_scale;
+    }
+
     while (row_idx + 1 < output.len) : (row_idx += 2) {
         const row0_start = row_idx * row_bytes;
         const row1_start = row0_start + row_bytes;
@@ -524,7 +571,7 @@ test "wide q6 matmul rows match row-dot path" {
     const testing = std.testing;
 
     inline for (.{ tensor_store.handwritten_hidden_width, tensor_store.handwritten_intermediate_width }) |cols| {
-        const rows: usize = 3;
+        const rows: usize = 5;
         const row_bytes = 4 + (try std.math.divCeil(usize, cols * 6, 8));
         const matrix = try testing.allocator.alloc(u8, rows * row_bytes);
         defer testing.allocator.free(matrix);
