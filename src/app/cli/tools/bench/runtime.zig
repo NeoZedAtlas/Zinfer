@@ -40,13 +40,14 @@ pub fn benchPrompt(
         prompt_ids[idx] = token_id;
     }
 
-    var cache = try optimized_kv_cache.ModelCache.init(
+    var cache = try optimized_kv_cache.ModelCache.initWithLayout(
         allocator,
         cfg.num_hidden_layers,
         prompt_ids.len + options.max_new_tokens,
         cfg.num_key_value_heads,
         cfg.head_dim,
         resolved_kv_cache_scheme,
+        options.q8_layout,
     );
     defer cache.deinit();
     var workspace = try runtime.model.initWorkspace(prompt_ids.len + options.max_new_tokens);
@@ -73,13 +74,14 @@ pub fn benchPrompt(
         cfg,
         prompt_ids.len + options.max_new_tokens,
         resolved_kv_cache_scheme,
+        options.q8_layout,
     );
     const stdout = std.fs.File.stdout().deprecatedWriter();
     try stdout.print("Zinfer benchmark\n", .{});
     try stdout.print("model_dir: {s}\n", .{model_dir});
     try stdout.print("backend: {s}\n", .{runtime.model.backendName()});
     try stdout.print("kv_cache: {s}\n", .{resolved_kv_cache_scheme.name()});
-    try stdout.print("q8_layout: {s}\n", .{optimized_kv_cache.default_q8_layout.name()});
+    try stdout.print("q8_layout: {s}\n", .{options.q8_layout.name()});
     try stdout.print("kernel_isa: {s}\n", .{kernel_registry.activeIsa().name()});
     try stdout.print("threads: {d}\n", .{runtime.model.thread_count});
     try stdout.print("prompt_tokens: {d}\n", .{prompt_ids.len});
@@ -152,6 +154,7 @@ fn initBenchSuiteOptions(
         .stop_sequences = try allocator.alloc([]const u8, 0),
         .backend_scheme = backend_scheme,
         .kv_cache_scheme = .auto,
+        .q8_layout = optimized_kv_cache.default_q8_layout,
         .thread_count = 1,
     };
 }

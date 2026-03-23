@@ -165,6 +165,23 @@ pub const LayerWeights = struct {
                     cache.len,
                     workspace.scores[0..cache.len],
                 ),
+                .paged_head_major => try gqa_attention.forwardProjectedSingleTokenQ8CachePagedHeadMajor(
+                    self.spec.attentionSpec(),
+                    workspace.attn_flat,
+                    workspace.q_proj,
+                    cache.q8KeysPagedHeadMajor(),
+                    cache.q8KeyScalesPagedHeadMajor(),
+                    cache.q8ValuesPagedHeadMajor(),
+                    cache.q8ValueScalesPagedHeadMajor(),
+                    cache.q8PagedHeadStride(),
+                    cache.q8PagedScaleHeadStride(),
+                    cache.q8PageDataStride(),
+                    cache.q8PageScaleStride(),
+                    cache.q8PageLen(),
+                    cache.q8PagesPerHead(),
+                    cache.len,
+                    workspace.scores[0..cache.len],
+                ),
             },
         }
 

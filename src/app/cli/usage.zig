@@ -53,6 +53,7 @@ pub fn printUsage() !void {
         \\  --stop <text>           (repeatable)
         \\  --backend <auto|bf16|q8|q6|q4>
         \\  --kv-cache <auto|bf16|q8>
+        \\  --q8-layout <token_major_legacy|head_major|paged_head_major>
         \\  --threads <usize>       (0 = auto)
         \\  --stream
         \\  --load <path>           (chat only)

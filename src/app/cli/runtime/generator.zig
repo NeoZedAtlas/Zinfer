@@ -67,13 +67,14 @@ pub const GeneratorRuntime = struct {
 
         const cfg = self.model.cfg;
         const resolved_kv_cache_scheme = optimized_kv_cache.resolveScheme(options.kv_cache_scheme, self.model.backendName());
-        var cache = try optimized_kv_cache.ModelCache.init(
+        var cache = try optimized_kv_cache.ModelCache.initWithLayout(
             self.allocator,
             cfg.num_hidden_layers,
             prompt_ids.len + options.max_new_tokens,
             cfg.num_key_value_heads,
             cfg.head_dim,
             resolved_kv_cache_scheme,
+            options.q8_layout,
         );
         defer cache.deinit();
         var workspace = try self.model.initWorkspace(prompt_ids.len + options.max_new_tokens);

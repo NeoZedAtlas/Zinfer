@@ -140,6 +140,91 @@ pub fn scaledDotProductAttentionSingleQueryQ8CacheHeadMajor(
     );
 }
 
+pub fn scaledDotProductAttentionSingleQueryQ8CachePagedHeadMajor(
+    output: []f32,
+    query: []const f32,
+    key_cache: []const i8,
+    key_scales: []const u16,
+    value_cache: []const i8,
+    value_scales: []const u16,
+    head_data_stride: usize,
+    head_scale_stride: usize,
+    page_data_stride: usize,
+    page_scale_stride: usize,
+    page_len: usize,
+    pages_per_head: usize,
+    seq_len: usize,
+    num_query_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    scores_scratch: []f32,
+) !void {
+    if (num_query_heads == 0 or num_key_value_heads == 0 or head_dim == 0) {
+        return error.InvalidDimensions;
+    }
+    if (num_query_heads % num_key_value_heads != 0) return error.InvalidGrouping;
+    if (seq_len == 0 or page_len == 0) return error.InvalidSequenceLength;
+    if (output.len != num_query_heads * head_dim) return error.SizeMismatch;
+    if (query.len != num_query_heads * head_dim) return error.SizeMismatch;
+    const scale_groups_per_head = std.math.divCeil(usize, head_dim, q8_cache_group_size) catch return error.InvalidDimensions;
+    if (page_data_stride < page_len * head_dim) return error.SizeMismatch;
+    if (page_scale_stride < page_len * scale_groups_per_head) return error.SizeMismatch;
+    if (head_data_stride < pages_per_head * page_data_stride) return error.SizeMismatch;
+    if (head_scale_stride < pages_per_head * page_scale_stride) return error.SizeMismatch;
+    if (pages_per_head * page_len < seq_len) return error.SizeMismatch;
+    if (key_cache.len < num_key_value_heads * head_data_stride) return error.SizeMismatch;
+    if (value_cache.len < num_key_value_heads * head_data_stride) return error.SizeMismatch;
+    if (key_scales.len < num_key_value_heads * head_scale_stride) return error.SizeMismatch;
+    if (value_scales.len < num_key_value_heads * head_scale_stride) return error.SizeMismatch;
+    if (scores_scratch.len < seq_len) return error.InsufficientScratchSpace;
+
+    const entry = kernel_registry.resolve(.{ .attention_q8_decode = .{
+        .head_dim = head_dim,
+        .layout = .paged_head_major,
+    } });
+    if (entry.shape == .qwen3_head_dim_128 and scale_groups_per_head == handwritten_q8_scale_groups) {
+        return scaledDotProductAttentionSingleQueryQ8CachePagedHeadMajor128(
+            output,
+            query,
+            key_cache,
+            key_scales,
+            value_cache,
+            value_scales,
+            head_data_stride,
+            head_scale_stride,
+            page_data_stride,
+            page_scale_stride,
+            page_len,
+            pages_per_head,
+            seq_len,
+            num_query_heads,
+            num_key_value_heads,
+            scores_scratch,
+        );
+    }
+
+    return scaledDotProductAttentionSingleQueryQ8CachePagedHeadMajorGeneric(
+        output,
+        query,
+        key_cache,
+        key_scales,
+        value_cache,
+        value_scales,
+        head_data_stride,
+        head_scale_stride,
+        page_data_stride,
+        page_scale_stride,
+        page_len,
+        pages_per_head,
+        seq_len,
+        num_query_heads,
+        num_key_value_heads,
+        head_dim,
+        scale_groups_per_head,
+        scores_scratch,
+    );
+}
+
 fn scaledDotProductAttentionSingleQueryQ8CacheGeneric(
     output: []f32,
     query: []const f32,
@@ -250,6 +335,81 @@ fn scaledDotProductAttentionSingleQueryQ8CacheHeadMajorGeneric(
     }
 }
 
+fn scaledDotProductAttentionSingleQueryQ8CachePagedHeadMajorGeneric(
+    output: []f32,
+    query: []const f32,
+    key_cache: []const i8,
+    key_scales: []const u16,
+    value_cache: []const i8,
+    value_scales: []const u16,
+    head_data_stride: usize,
+    head_scale_stride: usize,
+    page_data_stride: usize,
+    page_scale_stride: usize,
+    page_len: usize,
+    pages_per_head: usize,
+    seq_len: usize,
+    num_query_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    scale_groups_per_head: usize,
+    scores_scratch: []f32,
+) !void {
+    const group_size = num_query_heads / num_key_value_heads;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    @memset(output, 0.0);
+
+    for (0..num_query_heads) |q_head_idx| {
+        const q_start = q_head_idx * head_dim;
+        const q_slice = query[q_start .. q_start + head_dim];
+        const kv_head_idx = q_head_idx / group_size;
+        const head_data_start = kv_head_idx * head_data_stride;
+        const head_scale_start = kv_head_idx * head_scale_stride;
+        const scores = scores_scratch[0..seq_len];
+
+        var pos_base: usize = 0;
+        for (0..pages_per_head) |page_idx| {
+            if (pos_base >= seq_len) break;
+            const page_data_start = head_data_start + page_idx * page_data_stride;
+            const page_scale_start = head_scale_start + page_idx * page_scale_stride;
+            const page_seq_len = @min(page_len, seq_len - pos_base);
+            for (0..page_seq_len) |page_offset| {
+                const cache_start = page_data_start + page_offset * head_dim;
+                const scale_start = page_scale_start + page_offset * scale_groups_per_head;
+                scores[pos_base + page_offset] = dotQ8GroupedSlice(
+                    q_slice,
+                    key_cache[cache_start .. cache_start + head_dim],
+                    key_scales[scale_start .. scale_start + scale_groups_per_head],
+                ) * scale;
+            }
+            pos_base += page_seq_len;
+        }
+
+        try basic.softmaxInPlace(scores);
+
+        const out_slice = output[q_start .. q_start + head_dim];
+        pos_base = 0;
+        for (0..pages_per_head) |page_idx| {
+            if (pos_base >= seq_len) break;
+            const page_data_start = head_data_start + page_idx * page_data_stride;
+            const page_scale_start = head_scale_start + page_idx * page_scale_stride;
+            const page_seq_len = @min(page_len, seq_len - pos_base);
+            for (0..page_seq_len) |page_offset| {
+                const cache_start = page_data_start + page_offset * head_dim;
+                const scale_start = page_scale_start + page_offset * scale_groups_per_head;
+                axpyQ8GroupedSliceInPlace(
+                    out_slice,
+                    scores[pos_base + page_offset],
+                    value_cache[cache_start .. cache_start + head_dim],
+                    value_scales[scale_start .. scale_start + scale_groups_per_head],
+                );
+            }
+            pos_base += page_seq_len;
+        }
+    }
+}
+
 fn scaledDotProductAttentionSingleQueryQ8Cache128(
     output: []f32,
     query: []const f32,
@@ -296,6 +456,123 @@ fn scaledDotProductAttentionSingleQueryQ8Cache128(
             value_scales,
             num_key_value_heads,
             kv_head_idx,
+        );
+    }
+}
+
+fn scaledDotProductAttentionSingleQueryQ8CachePagedHeadMajor128(
+    output: []f32,
+    query: []const f32,
+    key_cache: []const i8,
+    key_scales: []const u16,
+    value_cache: []const i8,
+    value_scales: []const u16,
+    head_data_stride: usize,
+    head_scale_stride: usize,
+    page_data_stride: usize,
+    page_scale_stride: usize,
+    page_len: usize,
+    pages_per_head: usize,
+    seq_len: usize,
+    num_query_heads: usize,
+    num_key_value_heads: usize,
+    scores_scratch: []f32,
+) !void {
+    const head_dim = handwritten_q8_head_dim;
+    const group_size = num_query_heads / num_key_value_heads;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    @memset(output, 0.0);
+
+    if (group_size == 2 and seq_len <= paired_scores_max_seq_len) {
+        var paired_scores: [paired_scores_max_seq_len]f32 = undefined;
+        var q_head_idx: usize = 0;
+        while (q_head_idx < num_query_heads) : (q_head_idx += 2) {
+            const q0_start = q_head_idx * head_dim;
+            const q1_start = q0_start + head_dim;
+            const q0_slice = query[q0_start .. q0_start + head_dim];
+            const q1_slice = query[q1_start .. q1_start + head_dim];
+            const kv_head_idx = q_head_idx / group_size;
+            const head_data_start = kv_head_idx * head_data_stride;
+            const head_scale_start = kv_head_idx * head_scale_stride;
+            const scores0 = scores_scratch[0..seq_len];
+            const scores1 = paired_scores[0..seq_len];
+
+            var pos_base: usize = 0;
+            for (0..pages_per_head) |page_idx| {
+                if (pos_base >= seq_len) break;
+                const page_data_start = head_data_start + page_idx * page_data_stride;
+                const page_scale_start = head_scale_start + page_idx * page_scale_stride;
+                const page_seq_len = @min(page_len, seq_len - pos_base);
+                for (0..page_seq_len) |page_offset| {
+                    const cache_start = page_data_start + page_offset * head_dim;
+                    const scale_start = page_scale_start + page_offset * handwritten_q8_scale_groups;
+                    const pair = dotQ8GroupedSlice128PairExact(
+                        q0_slice,
+                        q1_slice,
+                        key_cache[cache_start .. cache_start + head_dim],
+                        key_scales[scale_start .. scale_start + handwritten_q8_scale_groups],
+                    );
+                    scores0[pos_base + page_offset] = pair[0] * scale;
+                    scores1[pos_base + page_offset] = pair[1] * scale;
+                }
+                pos_base += page_seq_len;
+            }
+
+            try basic.softmaxInPlace(scores0);
+            try basic.softmaxInPlace(scores1);
+
+            accumulateQ8ValueHead128PagedHeadMajorPair(
+                output[q0_start .. q0_start + head_dim],
+                output[q1_start .. q1_start + head_dim],
+                scores0,
+                scores1,
+                value_cache[head_data_start .. head_data_start + pages_per_head * page_data_stride],
+                value_scales[head_scale_start .. head_scale_start + pages_per_head * page_scale_stride],
+                page_data_stride,
+                page_scale_stride,
+                page_len,
+            );
+        }
+        return;
+    }
+
+    for (0..num_query_heads) |q_head_idx| {
+        const q_start = q_head_idx * head_dim;
+        const q_slice = query[q_start .. q_start + head_dim];
+        const kv_head_idx = q_head_idx / group_size;
+        const head_data_start = kv_head_idx * head_data_stride;
+        const head_scale_start = kv_head_idx * head_scale_stride;
+        const scores = scores_scratch[0..seq_len];
+
+        var pos_base: usize = 0;
+        for (0..pages_per_head) |page_idx| {
+            if (pos_base >= seq_len) break;
+            const page_data_start = head_data_start + page_idx * page_data_stride;
+            const page_scale_start = head_scale_start + page_idx * page_scale_stride;
+            const page_seq_len = @min(page_len, seq_len - pos_base);
+            for (0..page_seq_len) |page_offset| {
+                const cache_start = page_data_start + page_offset * head_dim;
+                const scale_start = page_scale_start + page_offset * handwritten_q8_scale_groups;
+                scores[pos_base + page_offset] = dotQ8GroupedSlice128Exact(
+                    q_slice,
+                    key_cache[cache_start .. cache_start + head_dim],
+                    key_scales[scale_start .. scale_start + handwritten_q8_scale_groups],
+                ) * scale;
+            }
+            pos_base += page_seq_len;
+        }
+
+        try basic.softmaxInPlace(scores);
+
+        accumulateQ8ValueHead128PagedHeadMajor(
+            output[q_start .. q_start + head_dim],
+            scores,
+            value_cache[head_data_start .. head_data_start + pages_per_head * page_data_stride],
+            value_scales[head_scale_start .. head_scale_start + pages_per_head * page_scale_stride],
+            page_data_stride,
+            page_scale_stride,
+            page_len,
         );
     }
 }
@@ -695,6 +972,166 @@ fn accumulateQ8ValueHead128HeadMajorPair(
     output1[112..128].* = acc17;
 }
 
+fn accumulateQ8ValueHead128PagedHeadMajor(
+    output: []f32,
+    scores: []const f32,
+    value_cache_head: []const i8,
+    value_scales_head: []const u16,
+    page_data_stride: usize,
+    page_scale_stride: usize,
+    page_len: usize,
+) void {
+    std.debug.assert(output.len == handwritten_q8_head_dim);
+
+    var acc0: @Vector(16, f32) = @splat(0.0);
+    var acc1: @Vector(16, f32) = @splat(0.0);
+    var acc2: @Vector(16, f32) = @splat(0.0);
+    var acc3: @Vector(16, f32) = @splat(0.0);
+    var acc4: @Vector(16, f32) = @splat(0.0);
+    var acc5: @Vector(16, f32) = @splat(0.0);
+    var acc6: @Vector(16, f32) = @splat(0.0);
+    var acc7: @Vector(16, f32) = @splat(0.0);
+
+    var pos_base: usize = 0;
+    var page_idx: usize = 0;
+    while (pos_base < scores.len) : (page_idx += 1) {
+        const page_data_start = page_idx * page_data_stride;
+        const page_scale_start = page_idx * page_scale_stride;
+        const page_seq_len = @min(page_len, scores.len - pos_base);
+        for (0..page_seq_len) |page_offset| {
+            const weight = scores[pos_base + page_offset];
+            const cache_start = page_data_start + page_offset * handwritten_q8_head_dim;
+            const scale_start = page_scale_start + page_offset * handwritten_q8_scale_groups;
+            acc0 += scaledQ8Vector16(value_cache_head, cache_start + 0, weight * bfloat16.toF32(value_scales_head[scale_start + 0]));
+            acc1 += scaledQ8Vector16(value_cache_head, cache_start + 16, weight * bfloat16.toF32(value_scales_head[scale_start + 1]));
+            acc2 += scaledQ8Vector16(value_cache_head, cache_start + 32, weight * bfloat16.toF32(value_scales_head[scale_start + 2]));
+            acc3 += scaledQ8Vector16(value_cache_head, cache_start + 48, weight * bfloat16.toF32(value_scales_head[scale_start + 3]));
+            acc4 += scaledQ8Vector16(value_cache_head, cache_start + 64, weight * bfloat16.toF32(value_scales_head[scale_start + 4]));
+            acc5 += scaledQ8Vector16(value_cache_head, cache_start + 80, weight * bfloat16.toF32(value_scales_head[scale_start + 5]));
+            acc6 += scaledQ8Vector16(value_cache_head, cache_start + 96, weight * bfloat16.toF32(value_scales_head[scale_start + 6]));
+            acc7 += scaledQ8Vector16(value_cache_head, cache_start + 112, weight * bfloat16.toF32(value_scales_head[scale_start + 7]));
+        }
+        pos_base += page_seq_len;
+    }
+
+    output[0..16].* = acc0;
+    output[16..32].* = acc1;
+    output[32..48].* = acc2;
+    output[48..64].* = acc3;
+    output[64..80].* = acc4;
+    output[80..96].* = acc5;
+    output[96..112].* = acc6;
+    output[112..128].* = acc7;
+}
+
+fn accumulateQ8ValueHead128PagedHeadMajorPair(
+    output0: []f32,
+    output1: []f32,
+    scores0: []const f32,
+    scores1: []const f32,
+    value_cache_head: []const i8,
+    value_scales_head: []const u16,
+    page_data_stride: usize,
+    page_scale_stride: usize,
+    page_len: usize,
+) void {
+    std.debug.assert(output0.len == handwritten_q8_head_dim);
+    std.debug.assert(output1.len == handwritten_q8_head_dim);
+
+    var acc00: @Vector(16, f32) = @splat(0.0);
+    var acc01: @Vector(16, f32) = @splat(0.0);
+    var acc02: @Vector(16, f32) = @splat(0.0);
+    var acc03: @Vector(16, f32) = @splat(0.0);
+    var acc04: @Vector(16, f32) = @splat(0.0);
+    var acc05: @Vector(16, f32) = @splat(0.0);
+    var acc06: @Vector(16, f32) = @splat(0.0);
+    var acc07: @Vector(16, f32) = @splat(0.0);
+    var acc10: @Vector(16, f32) = @splat(0.0);
+    var acc11: @Vector(16, f32) = @splat(0.0);
+    var acc12: @Vector(16, f32) = @splat(0.0);
+    var acc13: @Vector(16, f32) = @splat(0.0);
+    var acc14: @Vector(16, f32) = @splat(0.0);
+    var acc15: @Vector(16, f32) = @splat(0.0);
+    var acc16: @Vector(16, f32) = @splat(0.0);
+    var acc17: @Vector(16, f32) = @splat(0.0);
+
+    var pos_base: usize = 0;
+    var page_idx: usize = 0;
+    while (pos_base < scores0.len) : (page_idx += 1) {
+        const page_data_start = page_idx * page_data_stride;
+        const page_scale_start = page_idx * page_scale_stride;
+        const page_seq_len = @min(page_len, scores0.len - pos_base);
+        for (0..page_seq_len) |page_offset| {
+            const weight0 = scores0[pos_base + page_offset];
+            const weight1 = scores1[pos_base + page_offset];
+            const cache_start = page_data_start + page_offset * handwritten_q8_head_dim;
+            const scale_start = page_scale_start + page_offset * handwritten_q8_scale_groups;
+
+            inline for (0..handwritten_q8_scale_groups) |group_idx| {
+                const block_start = cache_start + group_idx * 16;
+                const value_vec = loadQ8Vector16Unscaled(value_cache_head, block_start);
+                const scale = bfloat16.toF32(value_scales_head[scale_start + group_idx]);
+                const scaled0: @Vector(16, f32) = @splat(weight0 * scale);
+                const scaled1: @Vector(16, f32) = @splat(weight1 * scale);
+                switch (group_idx) {
+                    0 => {
+                        acc00 += value_vec * scaled0;
+                        acc10 += value_vec * scaled1;
+                    },
+                    1 => {
+                        acc01 += value_vec * scaled0;
+                        acc11 += value_vec * scaled1;
+                    },
+                    2 => {
+                        acc02 += value_vec * scaled0;
+                        acc12 += value_vec * scaled1;
+                    },
+                    3 => {
+                        acc03 += value_vec * scaled0;
+                        acc13 += value_vec * scaled1;
+                    },
+                    4 => {
+                        acc04 += value_vec * scaled0;
+                        acc14 += value_vec * scaled1;
+                    },
+                    5 => {
+                        acc05 += value_vec * scaled0;
+                        acc15 += value_vec * scaled1;
+                    },
+                    6 => {
+                        acc06 += value_vec * scaled0;
+                        acc16 += value_vec * scaled1;
+                    },
+                    7 => {
+                        acc07 += value_vec * scaled0;
+                        acc17 += value_vec * scaled1;
+                    },
+                    else => unreachable,
+                }
+            }
+        }
+        pos_base += page_seq_len;
+    }
+
+    output0[0..16].* = acc00;
+    output0[16..32].* = acc01;
+    output0[32..48].* = acc02;
+    output0[48..64].* = acc03;
+    output0[64..80].* = acc04;
+    output0[80..96].* = acc05;
+    output0[96..112].* = acc06;
+    output0[112..128].* = acc07;
+
+    output1[0..16].* = acc10;
+    output1[16..32].* = acc11;
+    output1[32..48].* = acc12;
+    output1[48..64].* = acc13;
+    output1[64..80].* = acc14;
+    output1[80..96].* = acc15;
+    output1[96..112].* = acc16;
+    output1[112..128].* = acc17;
+}
+
 fn scaledQ8Vector16(input_q8: []const i8, start: usize, scale: f32) @Vector(16, f32) {
     const scale_vec: @Vector(16, f32) = @splat(scale);
     return loadQ8Vector16Unscaled(input_q8, start) * scale_vec;
@@ -862,6 +1299,118 @@ test "q8 attention head-major path matches token-major path" {
     );
 
     for (output_token_major, output_head_major) |expected, actual| {
+        try testing.expectApproxEqAbs(expected, actual, 1e-5);
+    }
+}
+
+test "q8 attention paged head-major path matches head-major path" {
+    const testing = std.testing;
+
+    const seq_len = 37;
+    const page_len = 32;
+    const pages_per_head = 2;
+    const num_query_heads = 4;
+    const num_key_value_heads = 2;
+    const head_dim = handwritten_q8_head_dim;
+    const scale_groups_per_head = handwritten_q8_scale_groups;
+    const total_query = num_query_heads * head_dim;
+    const total_cache = seq_len * num_key_value_heads * head_dim;
+    const total_scales = seq_len * num_key_value_heads * scale_groups_per_head;
+    const head_data_stride = seq_len * head_dim;
+    const head_scale_stride = seq_len * scale_groups_per_head;
+    const page_data_stride = page_len * head_dim;
+    const page_scale_stride = page_len * scale_groups_per_head;
+    const paged_total_cache = num_key_value_heads * pages_per_head * page_data_stride;
+    const paged_total_scales = num_key_value_heads * pages_per_head * page_scale_stride;
+
+    var query: [total_query]f32 = undefined;
+    var key_cache_token_major: [total_cache]i8 = undefined;
+    var value_cache_token_major: [total_cache]i8 = undefined;
+    var key_scales_token_major: [total_scales]u16 = undefined;
+    var value_scales_token_major: [total_scales]u16 = undefined;
+    var key_cache_head_major: [total_cache]i8 = undefined;
+    var value_cache_head_major: [total_cache]i8 = undefined;
+    var key_scales_head_major: [total_scales]u16 = undefined;
+    var value_scales_head_major: [total_scales]u16 = undefined;
+    var key_cache_paged: [paged_total_cache]i8 = [_]i8{0} ** paged_total_cache;
+    var value_cache_paged: [paged_total_cache]i8 = [_]i8{0} ** paged_total_cache;
+    var key_scales_paged: [paged_total_scales]u16 = [_]u16{0} ** paged_total_scales;
+    var value_scales_paged: [paged_total_scales]u16 = [_]u16{0} ** paged_total_scales;
+    var scores_head_major: [seq_len]f32 = undefined;
+    var scores_paged: [seq_len]f32 = undefined;
+    var output_head_major: [total_query]f32 = undefined;
+    var output_paged: [total_query]f32 = undefined;
+
+    for (&query, 0..) |*value, idx| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast((idx * 7 + 3) % 37)) - 18)) / 9.0;
+    }
+    for (&key_cache_token_major, 0..) |*value, idx| {
+        value.* = @intCast(@as(i16, @intCast((idx * 11 + 5) % 255)) - 127);
+        value_cache_token_major[idx] = @intCast(@as(i16, @intCast((idx * 13 + 9) % 255)) - 127);
+    }
+    for (&key_scales_token_major, 0..) |*value, idx| {
+        value.* = bfloat16.fromF32(@as(f32, @floatFromInt((idx % scale_groups_per_head) + 1)) / 127.0);
+        value_scales_token_major[idx] = bfloat16.fromF32(@as(f32, @floatFromInt((idx % scale_groups_per_head) + 2)) / 127.0);
+    }
+
+    for (0..num_key_value_heads) |head_idx| {
+        for (0..seq_len) |pos| {
+            const token_major_data_start = (pos * num_key_value_heads + head_idx) * head_dim;
+            const token_major_scale_start = (pos * num_key_value_heads + head_idx) * scale_groups_per_head;
+            const linear_data_start = head_idx * head_data_stride + pos * head_dim;
+            const linear_scale_start = head_idx * head_scale_stride + pos * scale_groups_per_head;
+            const page_idx = pos / page_len;
+            const page_offset = pos % page_len;
+            const paged_data_start = head_idx * pages_per_head * page_data_stride + page_idx * page_data_stride + page_offset * head_dim;
+            const paged_scale_start = head_idx * pages_per_head * page_scale_stride + page_idx * page_scale_stride + page_offset * scale_groups_per_head;
+            @memcpy(key_cache_head_major[linear_data_start .. linear_data_start + head_dim], key_cache_token_major[token_major_data_start .. token_major_data_start + head_dim]);
+            @memcpy(value_cache_head_major[linear_data_start .. linear_data_start + head_dim], value_cache_token_major[token_major_data_start .. token_major_data_start + head_dim]);
+            @memcpy(key_scales_head_major[linear_scale_start .. linear_scale_start + scale_groups_per_head], key_scales_token_major[token_major_scale_start .. token_major_scale_start + scale_groups_per_head]);
+            @memcpy(value_scales_head_major[linear_scale_start .. linear_scale_start + scale_groups_per_head], value_scales_token_major[token_major_scale_start .. token_major_scale_start + scale_groups_per_head]);
+            @memcpy(key_cache_paged[paged_data_start .. paged_data_start + head_dim], key_cache_token_major[token_major_data_start .. token_major_data_start + head_dim]);
+            @memcpy(value_cache_paged[paged_data_start .. paged_data_start + head_dim], value_cache_token_major[token_major_data_start .. token_major_data_start + head_dim]);
+            @memcpy(key_scales_paged[paged_scale_start .. paged_scale_start + scale_groups_per_head], key_scales_token_major[token_major_scale_start .. token_major_scale_start + scale_groups_per_head]);
+            @memcpy(value_scales_paged[paged_scale_start .. paged_scale_start + scale_groups_per_head], value_scales_token_major[token_major_scale_start .. token_major_scale_start + scale_groups_per_head]);
+        }
+    }
+
+    try scaledDotProductAttentionSingleQueryQ8CacheHeadMajor(
+        &output_head_major,
+        &query,
+        &key_cache_head_major,
+        &key_scales_head_major,
+        &value_cache_head_major,
+        &value_scales_head_major,
+        head_data_stride,
+        head_scale_stride,
+        seq_len,
+        num_query_heads,
+        num_key_value_heads,
+        head_dim,
+        &scores_head_major,
+    );
+
+    try scaledDotProductAttentionSingleQueryQ8CachePagedHeadMajor(
+        &output_paged,
+        &query,
+        &key_cache_paged,
+        &key_scales_paged,
+        &value_cache_paged,
+        &value_scales_paged,
+        pages_per_head * page_data_stride,
+        pages_per_head * page_scale_stride,
+        page_data_stride,
+        page_scale_stride,
+        page_len,
+        pages_per_head,
+        seq_len,
+        num_query_heads,
+        num_key_value_heads,
+        head_dim,
+        &scores_paged,
+    );
+
+    for (output_head_major, output_paged) |expected, actual| {
         try testing.expectApproxEqAbs(expected, actual, 1e-5);
     }
 }

@@ -16,5 +16,6 @@ pub const scaledDotProductAttentionSingleQueryBf16Cache = basic.scaledDotProduct
 pub const q8_cache_group_size = q8_cache.q8_cache_group_size;
 pub const scaledDotProductAttentionSingleQueryQ8Cache = q8_cache.scaledDotProductAttentionSingleQueryQ8Cache;
 pub const scaledDotProductAttentionSingleQueryQ8CacheHeadMajor = q8_cache.scaledDotProductAttentionSingleQueryQ8CacheHeadMajor;
+pub const scaledDotProductAttentionSingleQueryQ8CachePagedHeadMajor = q8_cache.scaledDotProductAttentionSingleQueryQ8CachePagedHeadMajor;
 pub const dotQ8GroupedSlice = q8_cache.dotQ8GroupedSlice;
 pub const axpyQ8GroupedSliceInPlace = q8_cache.axpyQ8GroupedSliceInPlace;

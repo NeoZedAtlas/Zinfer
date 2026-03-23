@@ -157,3 +157,42 @@ pub fn forwardProjectedSingleTokenQ8CacheHeadMajor(
         scores_scratch,
     );
 }
+
+pub fn forwardProjectedSingleTokenQ8CachePagedHeadMajor(
+    spec: spec_mod.AttentionSpec,
+    output: []f32,
+    projected_query: []const f32,
+    key_cache: []const i8,
+    key_scales: []const u16,
+    value_cache: []const i8,
+    value_scales: []const u16,
+    head_data_stride: usize,
+    head_scale_stride: usize,
+    page_data_stride: usize,
+    page_scale_stride: usize,
+    page_len: usize,
+    pages_per_head: usize,
+    seq_len: usize,
+    scores_scratch: []f32,
+) !void {
+    try spec.validate();
+    try attention.scaledDotProductAttentionSingleQueryQ8CachePagedHeadMajor(
+        output,
+        projected_query,
+        key_cache,
+        key_scales,
+        value_cache,
+        value_scales,
+        head_data_stride,
+        head_scale_stride,
+        page_data_stride,
+        page_scale_stride,
+        page_len,
+        pages_per_head,
+        seq_len,
+        spec.num_attention_heads,
+        spec.num_key_value_heads,
+        spec.head_dim,
+        scores_scratch,
+    );
+}

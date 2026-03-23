@@ -133,6 +133,9 @@ pub const ChatHistory = struct {
         try writer.writeAll("    \"kv_cache\": ");
         try writer.print("{f}", .{std.json.fmt(metadata.options.kv_cache_scheme.name(), .{})});
         try writer.writeAll(",\n");
+        try writer.writeAll("    \"q8_layout\": ");
+        try writer.print("{f}", .{std.json.fmt(metadata.options.q8_layout.name(), .{})});
+        try writer.writeAll(",\n");
         try writer.writeAll("    \"threads\": ");
         try writer.print("{d}", .{metadata.options.thread_count});
         try writer.writeAll(",\n");
@@ -340,6 +343,7 @@ test "chat history session save and load preserves tool calls" {
             .stop_sequences = @constCast(stop_sequences[0..]),
             .backend_scheme = .q4,
             .kv_cache_scheme = .q8,
+            .q8_layout = .head_major,
             .thread_count = 8,
         },
     });

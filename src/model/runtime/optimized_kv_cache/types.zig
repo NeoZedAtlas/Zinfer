@@ -26,13 +26,16 @@ pub const q8_group_size: usize = 16;
 pub const Q8Layout = enum {
     token_major_legacy,
     head_major,
+    paged_head_major,
 
     pub fn name(self: Q8Layout) []const u8 {
         return switch (self) {
             .token_major_legacy => "token_major_legacy",
             .head_major => "head_major",
+            .paged_head_major => "paged_head_major",
         };
     }
 };
 
+pub const q8_page_len: usize = 32;
 pub const default_q8_layout: Q8Layout = .head_major;

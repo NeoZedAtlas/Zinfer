@@ -8,13 +8,15 @@ pub fn estimateKvCacheBytes(
     cfg: decoder_family.DecoderConfig,
     max_seq_len: usize,
     kv_cache_scheme: optimized_kv_cache.Scheme,
+    q8_layout: optimized_kv_cache.Q8Layout,
 ) u64 {
-    return optimized_kv_cache.estimateBytes(
+    return optimized_kv_cache.estimateBytesWithLayout(
         cfg.num_hidden_layers,
         max_seq_len,
         cfg.num_key_value_heads,
         cfg.head_dim,
         kv_cache_scheme,
+        q8_layout,
     );
 }
 
@@ -82,6 +84,47 @@ pub fn transposeQ8CacheTokenToHeadMajor(
             );
             @memcpy(
                 dst_scales[head_major_scale_start .. head_major_scale_start + groups_per_head],
+                src_scales[token_major_scale_start .. token_major_scale_start + groups_per_head],
+            );
+        }
+    }
+}
+
+pub fn transposeQ8CacheTokenToPagedHeadMajor(
+    dst_values: []i8,
+    dst_scales: []u16,
+    src_values: []const i8,
+    src_scales: []const u16,
+    seq_len: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    page_len: usize,
+) void {
+    const groups_per_head = std.math.divCeil(usize, head_dim, attention.q8_cache_group_size) catch unreachable;
+    const pages_per_head = std.math.divCeil(usize, seq_len, page_len) catch unreachable;
+    const page_data_stride = page_len * head_dim;
+    const page_scale_stride = page_len * groups_per_head;
+    const head_data_stride = pages_per_head * page_data_stride;
+    const head_scale_stride = pages_per_head * page_scale_stride;
+
+    @memset(dst_values, 0);
+    @memset(dst_scales, 0);
+
+    for (0..num_key_value_heads) |head_idx| {
+        for (0..seq_len) |pos| {
+            const token_major_data_start = (pos * num_key_value_heads + head_idx) * head_dim;
+            const token_major_scale_start = (pos * num_key_value_heads + head_idx) * groups_per_head;
+            const page_idx = pos / page_len;
+            const page_offset = pos % page_len;
+            const paged_data_start = head_idx * head_data_stride + page_idx * page_data_stride + page_offset * head_dim;
+            const paged_scale_start = head_idx * head_scale_stride + page_idx * page_scale_stride + page_offset * groups_per_head;
+
+            @memcpy(
+                dst_values[paged_data_start .. paged_data_start + head_dim],
+                src_values[token_major_data_start .. token_major_data_start + head_dim],
+            );
+            @memcpy(
+                dst_scales[paged_scale_start .. paged_scale_start + groups_per_head],
                 src_scales[token_major_scale_start .. token_major_scale_start + groups_per_head],
             );
         }

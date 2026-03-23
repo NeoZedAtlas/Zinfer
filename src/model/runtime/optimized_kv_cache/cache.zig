@@ -25,20 +25,38 @@ pub const LayerKVCache = struct {
         head_dim: usize,
         scheme: types.Scheme,
     ) !LayerKVCache {
-        const total = try std.math.mul(usize, max_seq_len, try std.math.mul(usize, num_key_value_heads, head_dim));
-        const scale_total = try std.math.mul(usize, max_seq_len, quantize.scaleGroupsPerToken(num_key_value_heads, head_dim));
+        return initWithLayout(
+            allocator,
+            max_seq_len,
+            num_key_value_heads,
+            head_dim,
+            scheme,
+            types.default_q8_layout,
+        );
+    }
 
+    pub fn initWithLayout(
+        allocator: std.mem.Allocator,
+        max_seq_len: usize,
+        num_key_value_heads: usize,
+        head_dim: usize,
+        scheme: types.Scheme,
+        q8_layout: types.Q8Layout,
+    ) !LayerKVCache {
+        const q8_total = q8TotalElements(max_seq_len, num_key_value_heads, head_dim, q8_layout);
+        const q8_scale_total = q8TotalScaleGroups(max_seq_len, num_key_value_heads, head_dim, q8_layout);
+        const total = try std.math.mul(usize, max_seq_len, try std.math.mul(usize, num_key_value_heads, head_dim));
         const keys_bf16 = try allocator.alloc(u16, if (scheme == .bf16) total else 0);
         errdefer allocator.free(keys_bf16);
         const values_bf16 = try allocator.alloc(u16, if (scheme == .bf16) total else 0);
         errdefer allocator.free(values_bf16);
-        const keys_q8 = try allocator.alloc(i8, if (scheme == .q8) total else 0);
+        const keys_q8 = try allocator.alloc(i8, if (scheme == .q8) q8_total else 0);
         errdefer allocator.free(keys_q8);
-        const values_q8 = try allocator.alloc(i8, if (scheme == .q8) total else 0);
+        const values_q8 = try allocator.alloc(i8, if (scheme == .q8) q8_total else 0);
         errdefer allocator.free(values_q8);
-        const key_scales_q8 = try allocator.alloc(u16, if (scheme == .q8) scale_total else 0);
+        const key_scales_q8 = try allocator.alloc(u16, if (scheme == .q8) q8_scale_total else 0);
         errdefer allocator.free(key_scales_q8);
-        const value_scales_q8 = try allocator.alloc(u16, if (scheme == .q8) scale_total else 0);
+        const value_scales_q8 = try allocator.alloc(u16, if (scheme == .q8) q8_scale_total else 0);
         errdefer allocator.free(value_scales_q8);
 
         @memset(keys_bf16, 0);
@@ -51,7 +69,7 @@ pub const LayerKVCache = struct {
         return .{
             .allocator = allocator,
             .scheme = scheme,
-            .q8_layout = types.default_q8_layout,
+            .q8_layout = q8_layout,
             .max_seq_len = max_seq_len,
             .num_key_value_heads = num_key_value_heads,
             .head_dim = head_dim,
@@ -154,6 +172,55 @@ pub const LayerKVCache = struct {
         return self.max_seq_len * self.scaleGroupsPerHead();
     }
 
+    pub fn q8KeysPagedHeadMajor(self: *const LayerKVCache) []const i8 {
+        std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .paged_head_major);
+        return self.keys_q8;
+    }
+
+    pub fn q8ValuesPagedHeadMajor(self: *const LayerKVCache) []const i8 {
+        std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .paged_head_major);
+        return self.values_q8;
+    }
+
+    pub fn q8KeyScalesPagedHeadMajor(self: *const LayerKVCache) []const u16 {
+        std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .paged_head_major);
+        return self.key_scales_q8;
+    }
+
+    pub fn q8ValueScalesPagedHeadMajor(self: *const LayerKVCache) []const u16 {
+        std.debug.assert(self.scheme == .q8);
+        std.debug.assert(self.q8_layout == .paged_head_major);
+        return self.value_scales_q8;
+    }
+
+    pub fn q8PageLen(self: *const LayerKVCache) usize {
+        _ = self;
+        return types.q8_page_len;
+    }
+
+    pub fn q8PagesPerHead(self: *const LayerKVCache) usize {
+        return std.math.divCeil(usize, self.max_seq_len, self.q8PageLen()) catch unreachable;
+    }
+
+    pub fn q8PageDataStride(self: *const LayerKVCache) usize {
+        return self.q8PageLen() * self.head_dim;
+    }
+
+    pub fn q8PageScaleStride(self: *const LayerKVCache) usize {
+        return self.q8PageLen() * self.scaleGroupsPerHead();
+    }
+
+    pub fn q8PagedHeadStride(self: *const LayerKVCache) usize {
+        return self.q8PagesPerHead() * self.q8PageDataStride();
+    }
+
+    pub fn q8PagedScaleHeadStride(self: *const LayerKVCache) usize {
+        return self.q8PagesPerHead() * self.q8PageScaleStride();
+    }
+
     pub fn numKeyValueElementsPerToken(self: *const LayerKVCache) usize {
         return self.num_key_value_heads * self.head_dim;
     }
@@ -180,6 +247,7 @@ pub const LayerKVCache = struct {
         switch (self.q8_layout) {
             .token_major_legacy => self.appendQ8TokenMajor(key, value),
             .head_major => self.appendQ8HeadMajor(key, value),
+            .paged_head_major => self.appendQ8PagedHeadMajor(key, value),
         }
     }
 
@@ -239,6 +307,40 @@ pub const LayerKVCache = struct {
             }
         }
     }
+
+    fn appendQ8PagedHeadMajor(self: *LayerKVCache, key: []const f32, value: []const f32) void {
+        const scale_groups_per_head = self.scaleGroupsPerHead();
+        const page_len = self.q8PageLen();
+        const page_idx = self.len / page_len;
+        const page_offset = self.len % page_len;
+        const head_data_stride = self.q8PagedHeadStride();
+        const head_scale_stride = self.q8PagedScaleHeadStride();
+        const page_data_stride = self.q8PageDataStride();
+        const page_scale_stride = self.q8PageScaleStride();
+
+        for (0..self.num_key_value_heads) |head_idx| {
+            const head_start = head_idx * self.head_dim;
+            const key_slice = key[head_start .. head_start + self.head_dim];
+            const value_slice = value[head_start .. head_start + self.head_dim];
+            const token_data_start = head_idx * head_data_stride + page_idx * page_data_stride + page_offset * self.head_dim;
+            const token_scale_start = head_idx * head_scale_stride + page_idx * page_scale_stride + page_offset * scale_groups_per_head;
+            const key_out = self.keys_q8[token_data_start .. token_data_start + self.head_dim];
+            const value_out = self.values_q8[token_data_start .. token_data_start + self.head_dim];
+
+            for (0..scale_groups_per_head) |group_idx| {
+                const group_start = group_idx * types.q8_group_size;
+                const group_end = @min(self.head_dim, group_start + types.q8_group_size);
+                self.key_scales_q8[token_scale_start + group_idx] = quantize.quantizeQ8Slice(
+                    key_out[group_start..group_end],
+                    key_slice[group_start..group_end],
+                );
+                self.value_scales_q8[token_scale_start + group_idx] = quantize.quantizeQ8Slice(
+                    value_out[group_start..group_end],
+                    value_slice[group_start..group_end],
+                );
+            }
+        }
+    }
 };
 
 pub const ModelCache = struct {
@@ -254,6 +356,18 @@ pub const ModelCache = struct {
         head_dim: usize,
         scheme: types.Scheme,
     ) !ModelCache {
+        return initWithLayout(allocator, num_layers, max_seq_len, num_key_value_heads, head_dim, scheme, types.default_q8_layout);
+    }
+
+    pub fn initWithLayout(
+        allocator: std.mem.Allocator,
+        num_layers: usize,
+        max_seq_len: usize,
+        num_key_value_heads: usize,
+        head_dim: usize,
+        scheme: types.Scheme,
+        q8_layout: types.Q8Layout,
+    ) !ModelCache {
         const layers = try allocator.alloc(LayerKVCache, num_layers);
         errdefer allocator.free(layers);
 
@@ -264,7 +378,7 @@ pub const ModelCache = struct {
 
         for (layers, 0..) |*layer, idx| {
             _ = idx;
-            layer.* = try LayerKVCache.init(allocator, max_seq_len, num_key_value_heads, head_dim, scheme);
+            layer.* = try LayerKVCache.initWithLayout(allocator, max_seq_len, num_key_value_heads, head_dim, scheme, q8_layout);
             initialized += 1;
         }
 
@@ -288,6 +402,24 @@ pub fn estimateBytes(
     head_dim: usize,
     scheme: types.Scheme,
 ) u64 {
+    return estimateBytesWithLayout(
+        num_layers,
+        max_seq_len,
+        num_key_value_heads,
+        head_dim,
+        scheme,
+        types.default_q8_layout,
+    );
+}
+
+pub fn estimateBytesWithLayout(
+    num_layers: usize,
+    max_seq_len: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    scheme: types.Scheme,
+    q8_layout: types.Q8Layout,
+) u64 {
     return switch (scheme) {
         .auto => unreachable,
         .bf16 => blk: {
@@ -300,20 +432,38 @@ pub fn estimateBytes(
             break :blk @intCast(total);
         },
         .q8 => blk: {
-            const scale_groups_per_head = std.math.divCeil(usize, head_dim, types.q8_group_size) catch unreachable;
+            const q8_total = q8TotalElements(max_seq_len, num_key_value_heads, head_dim, q8_layout);
+            const q8_scale_total = q8TotalScaleGroups(max_seq_len, num_key_value_heads, head_dim, q8_layout);
             const quantized = @as(u128, num_layers) *
-                @as(u128, max_seq_len) *
-                @as(u128, num_key_value_heads) *
-                @as(u128, head_dim) *
+                @as(u128, q8_total) *
                 2 *
                 @sizeOf(i8);
             const scales = @as(u128, num_layers) *
-                @as(u128, max_seq_len) *
-                @as(u128, num_key_value_heads) *
-                @as(u128, scale_groups_per_head) *
+                @as(u128, q8_scale_total) *
                 2 *
                 @sizeOf(u16);
             break :blk @intCast(quantized + scales);
+        },
+    };
+}
+
+fn q8TotalElements(max_seq_len: usize, num_key_value_heads: usize, head_dim: usize, layout: types.Q8Layout) usize {
+    return switch (layout) {
+        .token_major_legacy, .head_major => max_seq_len * num_key_value_heads * head_dim,
+        .paged_head_major => blk: {
+            const pages_per_head = std.math.divCeil(usize, max_seq_len, types.q8_page_len) catch unreachable;
+            break :blk num_key_value_heads * pages_per_head * types.q8_page_len * head_dim;
+        },
+    };
+}
+
+fn q8TotalScaleGroups(max_seq_len: usize, num_key_value_heads: usize, head_dim: usize, layout: types.Q8Layout) usize {
+    const scale_groups_per_head = std.math.divCeil(usize, head_dim, types.q8_group_size) catch unreachable;
+    return switch (layout) {
+        .token_major_legacy, .head_major => max_seq_len * num_key_value_heads * scale_groups_per_head,
+        .paged_head_major => blk: {
+            const pages_per_head = std.math.divCeil(usize, max_seq_len, types.q8_page_len) catch unreachable;
+            break :blk num_key_value_heads * pages_per_head * types.q8_page_len * scale_groups_per_head;
         },
     };
 }
@@ -353,4 +503,49 @@ test "optimized kv cache stores q8 values with per-head scale" {
     try testing.expectApproxEqAbs(@as(f32, 0.5 / 127.0), bfloat16.toF32(cache.q8KeyScalesHeadMajor()[1]), 1e-3);
     try testing.expectEqual(@as(i8, 64), cache.q8KeysHeadMajor()[0]);
     try testing.expectEqual(@as(i8, 64), cache.q8KeysHeadMajor()[2]);
+}
+
+test "optimized kv cache stores q8 paged head-major values by page" {
+    const testing = std.testing;
+
+    var cache = try LayerKVCache.initWithLayout(testing.allocator, 40, 2, 16, .q8, .paged_head_major);
+    defer cache.deinit();
+
+    var key0: [32]f32 = undefined;
+    var value0: [32]f32 = undefined;
+    var key1: [32]f32 = undefined;
+    var value1: [32]f32 = undefined;
+    for (&key0, &value0, 0..) |*key_value, *value_value, idx| {
+        key_value.* = @as(f32, @floatFromInt(idx + 1));
+        value_value.* = @as(f32, @floatFromInt(idx + 101));
+        key1[idx] = @as(f32, @floatFromInt(idx + 201));
+        value1[idx] = @as(f32, @floatFromInt(idx + 301));
+    }
+
+    try cache.append(&key0, &value0);
+    for (1..types.q8_page_len) |_| {
+        var zeros: [32]f32 = [_]f32{0.0} ** 32;
+        try cache.append(&zeros, &zeros);
+    }
+    try cache.append(&key1, &value1);
+
+    const head_stride = cache.q8PagedHeadStride();
+    const page_stride = cache.q8PageDataStride();
+    var expected_page0_key: [16]i8 = undefined;
+    var expected_page0_value: [16]i8 = undefined;
+    var expected_page1_key: [16]i8 = undefined;
+    var expected_page1_value: [16]i8 = undefined;
+    _ = quantize.quantizeQ8Slice(&expected_page0_key, key0[0..16]);
+    _ = quantize.quantizeQ8Slice(&expected_page0_value, value0[0..16]);
+    _ = quantize.quantizeQ8Slice(&expected_page1_key, key1[0..16]);
+    _ = quantize.quantizeQ8Slice(&expected_page1_value, value1[0..16]);
+
+    try testing.expectEqual(types.Q8Layout.paged_head_major, cache.q8_layout);
+    try testing.expectEqual(@as(usize, types.q8_page_len * 16), page_stride);
+    try testing.expectEqual(expected_page0_key[0], cache.q8KeysPagedHeadMajor()[0]);
+    try testing.expectEqual(expected_page0_value[0], cache.q8ValuesPagedHeadMajor()[0]);
+    try testing.expectEqual(expected_page1_key[0], cache.q8KeysPagedHeadMajor()[page_stride]);
+    try testing.expectEqual(expected_page1_value[0], cache.q8ValuesPagedHeadMajor()[page_stride]);
+    try testing.expectEqual(@as(usize, 33), cache.len);
+    try testing.expect(head_stride > page_stride);
 }

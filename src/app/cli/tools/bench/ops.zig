@@ -310,6 +310,12 @@ fn benchAttentionFullProfile(
     const total_scales = seq_len * cfg.num_key_value_heads * scale_groups_per_head;
     const head_data_stride = seq_len * cfg.head_dim;
     const head_scale_stride = seq_len * scale_groups_per_head;
+    const page_len = optimized_kv_cache.q8_page_len;
+    const pages_per_head = try std.math.divCeil(usize, seq_len, page_len);
+    const page_data_stride = page_len * cfg.head_dim;
+    const page_scale_stride = page_len * scale_groups_per_head;
+    const paged_total_cache = cfg.num_key_value_heads * pages_per_head * page_data_stride;
+    const paged_total_scales = cfg.num_key_value_heads * pages_per_head * page_scale_stride;
 
     const query = try allocator.alloc(f32, total_query);
     defer allocator.free(query);
@@ -333,6 +339,14 @@ fn benchAttentionFullProfile(
     defer allocator.free(key_scales_head_major);
     const value_scales_head_major = try allocator.alloc(u16, total_scales);
     defer allocator.free(value_scales_head_major);
+    const key_cache_paged_head_major = try allocator.alloc(i8, paged_total_cache);
+    defer allocator.free(key_cache_paged_head_major);
+    const value_cache_paged_head_major = try allocator.alloc(i8, paged_total_cache);
+    defer allocator.free(value_cache_paged_head_major);
+    const key_scales_paged_head_major = try allocator.alloc(u16, paged_total_scales);
+    defer allocator.free(key_scales_paged_head_major);
+    const value_scales_paged_head_major = try allocator.alloc(u16, paged_total_scales);
+    defer allocator.free(value_scales_paged_head_major);
 
     support.fillSyntheticF32(query, 43);
     support.fillSyntheticQ8Cache(key_cache_token_major, key_scales_token_major, cfg.head_dim, 59);
@@ -354,6 +368,26 @@ fn benchAttentionFullProfile(
         seq_len,
         cfg.num_key_value_heads,
         cfg.head_dim,
+    );
+    support.transposeQ8CacheTokenToPagedHeadMajor(
+        key_cache_paged_head_major,
+        key_scales_paged_head_major,
+        key_cache_token_major,
+        key_scales_token_major,
+        seq_len,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        page_len,
+    );
+    support.transposeQ8CacheTokenToPagedHeadMajor(
+        value_cache_paged_head_major,
+        value_scales_paged_head_major,
+        value_cache_token_major,
+        value_scales_token_major,
+        seq_len,
+        cfg.num_key_value_heads,
+        cfg.head_dim,
+        page_len,
     );
 
     var guard: f32 = 0.0;
@@ -382,6 +416,25 @@ fn benchAttentionFullProfile(
                 value_scales_head_major,
                 head_data_stride,
                 head_scale_stride,
+                seq_len,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                scores,
+            ),
+            .paged_head_major => try attention.scaledDotProductAttentionSingleQueryQ8CachePagedHeadMajor(
+                output,
+                query,
+                key_cache_paged_head_major,
+                key_scales_paged_head_major,
+                value_cache_paged_head_major,
+                value_scales_paged_head_major,
+                pages_per_head * page_data_stride,
+                pages_per_head * page_scale_stride,
+                page_data_stride,
+                page_scale_stride,
+                page_len,
+                pages_per_head,
                 seq_len,
                 cfg.num_attention_heads,
                 cfg.num_key_value_heads,
@@ -417,6 +470,25 @@ fn benchAttentionFullProfile(
                 value_scales_head_major,
                 head_data_stride,
                 head_scale_stride,
+                seq_len,
+                cfg.num_attention_heads,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                scores,
+            ),
+            .paged_head_major => try attention.scaledDotProductAttentionSingleQueryQ8CachePagedHeadMajor(
+                output,
+                query,
+                key_cache_paged_head_major,
+                key_scales_paged_head_major,
+                value_cache_paged_head_major,
+                value_scales_paged_head_major,
+                pages_per_head * page_data_stride,
+                pages_per_head * page_scale_stride,
+                page_data_stride,
+                page_scale_stride,
+                page_len,
+                pages_per_head,
                 seq_len,
                 cfg.num_attention_heads,
                 cfg.num_key_value_heads,
