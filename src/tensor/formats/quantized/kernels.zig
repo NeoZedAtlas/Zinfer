@@ -168,20 +168,28 @@ fn dotQ6RowFixed(comptime cols: usize, bytes: []const u8, row_offset: u64, input
 
     var acc0: @Vector(8, f32) = @splat(0.0);
     var acc1: @Vector(8, f32) = @splat(0.0);
+    var acc2: @Vector(8, f32) = @splat(0.0);
+    var acc3: @Vector(8, f32) = @splat(0.0);
     var index: usize = 0;
     var payload_index: usize = 0;
     while (index < cols) : ({
-        index += 16;
-        payload_index += 12;
+        index += 32;
+        payload_index += 24;
     }) {
         const q0 = loadQ6Vector8(payload, payload_index);
         const q1 = loadQ6Vector8(payload, payload_index + 6);
+        const q2 = loadQ6Vector8(payload, payload_index + 12);
+        const q3 = loadQ6Vector8(payload, payload_index + 18);
         const rhs0: @Vector(8, f32) = input[index..][0..8].*;
         const rhs1: @Vector(8, f32) = input[index + 8 ..][0..8].*;
+        const rhs2: @Vector(8, f32) = input[index + 16 ..][0..8].*;
+        const rhs3: @Vector(8, f32) = input[index + 24 ..][0..8].*;
         acc0 += q0 * rhs0;
         acc1 += q1 * rhs1;
+        acc2 += q2 * rhs2;
+        acc3 += q3 * rhs3;
     }
-    return @reduce(.Add, acc0 + acc1) * scale;
+    return @reduce(.Add, acc0 + acc1 + acc2 + acc3) * scale;
 }
 
 pub fn matmulQ6Rows(output: []f32, bytes: []const u8, row_bytes: usize, input: []const f32) void {
