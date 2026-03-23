@@ -3,6 +3,7 @@ const GenerateOptions = @import("../../args.zig").GenerateOptions;
 const cli_prompts = @import("../../prompts.zig");
 const cli_runtime = @import("../../runtime.zig");
 const decoder_family = @import("../../../../model/runtime/decoder_family.zig");
+const kernel_registry = @import("../../../../kernel/registry.zig");
 const optimized_kv_cache = @import("../../../../model/runtime/optimized_kv_cache.zig");
 const tensor_backend = @import("../../../../tensor/backends/backend.zig");
 const support = @import("support.zig");
@@ -78,6 +79,8 @@ pub fn benchPrompt(
     try stdout.print("model_dir: {s}\n", .{model_dir});
     try stdout.print("backend: {s}\n", .{runtime.model.backendName()});
     try stdout.print("kv_cache: {s}\n", .{resolved_kv_cache_scheme.name()});
+    try stdout.print("q8_layout: {s}\n", .{optimized_kv_cache.default_q8_layout.name()});
+    try stdout.print("kernel_isa: {s}\n", .{kernel_registry.activeIsa().name()});
     try stdout.print("threads: {d}\n", .{runtime.model.thread_count});
     try stdout.print("prompt_tokens: {d}\n", .{prompt_ids.len});
     try stdout.print("decode_tokens: {d}\n", .{decoded_tokens});
@@ -109,6 +112,8 @@ pub fn benchSuite(allocator: std.mem.Allocator, model_dir: []const u8) !void {
     try stdout.print("model_dir: {s}\n", .{model_dir});
     try stdout.print("threads: 1\n", .{});
     try stdout.print("kv_cache: auto\n", .{});
+    try stdout.print("q8_layout: {s}\n", .{optimized_kv_cache.default_q8_layout.name()});
+    try stdout.print("kernel_isa: {s}\n", .{kernel_registry.activeIsa().name()});
 
     for (profiles) |profile| {
         for (backends) |backend| {

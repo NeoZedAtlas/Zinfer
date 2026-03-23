@@ -1,6 +1,7 @@
 const std = @import("std");
 const attention = @import("../../../../kernel/attention/attention.zig");
 const cpu = @import("../../../../kernel/core/cpu.zig");
+const kernel_registry = @import("../../../../kernel/registry.zig");
 const bfloat16 = @import("../../../../tensor/formats/bfloat16.zig");
 const optimized_kv_cache = @import("../../../../model/runtime/optimized_kv_cache.zig");
 const decoder_family = @import("../../../../model/runtime/decoder_family.zig");
@@ -28,6 +29,8 @@ pub fn benchHandwrittenOps(
     try stdout.print("head_dim: {d}\n", .{cfg.head_dim});
     try stdout.print("attention_heads: {d}\n", .{cfg.num_attention_heads});
     try stdout.print("kv_heads: {d}\n", .{cfg.num_key_value_heads});
+    try stdout.print("q8_layout: {s}\n", .{optimized_kv_cache.default_q8_layout.name()});
+    try stdout.print("kernel_isa: {s}\n", .{kernel_registry.activeIsa().name()});
     try stdout.print("iterations: {s}\n", .{if (requested_iterations == 0) "auto" else "manual"});
     try stdout.print("\n[gemv-row]\n", .{});
     try benchGemvProfile(allocator, stdout, "hidden", cfg.hidden_size, requested_iterations);
